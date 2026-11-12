@@ -49,8 +49,14 @@ fn dec(v: f64, digits: usize) -> String {
     format!("{v:.digits$}").replace('.', ",")
 }
 
-fn gb(n: u64) -> String {
-    format!("{} Go ({} octets)", dec(n as f64 / 1e9, 2), thousands(n))
+/// Taille lisible + octets exacts : « 268 Mo (268 435 456 octets) » sous 1 Go,
+/// « 320,07 Go (320 072 933 376 octets) » au-delà (même seuil que la console).
+fn size_text(n: u64) -> String {
+    if n < 1_000_000_000 {
+        format!("{} Mo ({} octets)", dec(n as f64 / 1e6, 0), thousands(n))
+    } else {
+        format!("{} Go ({} octets)", dec(n as f64 / 1e9, 2), thousands(n))
+    }
 }
 
 fn or_dash(s: &str) -> String {
@@ -363,7 +369,7 @@ fn page1(rec: &EraseRecord, logo: Option<(u32, u32)>, generated: &str) -> Page {
     let real = if rec.hpa_dco.starts_with("Non") {
         "Non vérifiée (HPA/DCO non lu)".to_string()
     } else {
-        gb(d.size_bytes)
+        size_text(d.size_bytes)
     };
     for (l, v) in [
         ("Modèle", d.model.clone()),
@@ -375,7 +381,7 @@ fn page1(rec: &EraseRecord, logo: Option<(u32, u32)>, generated: &str) -> Page {
         yl += ROW;
     }
     for (l, v) in [
-        ("Taille apparente", gb(d.size_bytes)),
+        ("Taille apparente", size_text(d.size_bytes)),
         ("Taille réelle", real),
         ("Firmware", d.firmware.clone()),
     ] {
@@ -869,6 +875,72 @@ mod tests {
         r.verify_result = "Non demandée".into();
         assert!(contains(&render(&r, None), "NON V"));
         assert!(!contains(&render(&sample_record(), None), "NON V"));
+    }
+
+    #[test]
+    fn small_sizes_are_in_mo() {
+        assert_eq!(size_text(268_435_456), "268 Mo (268 435 456 octets)");
+        assert_eq!(
+            size_text(320_072_933_376),
+            "320,07 Go (320 072 933 376 octets)"
+        );
+        let mut r = sample_record();
+        r.disk.size_bytes = 268_435_456;
+        // Les parenthèses sont échappées dans les chaînes PDF.
+        assert!(contains(
+            &render(&r, None),
+            "268 Mo \\(268 435 456 octets\\)"
+        ));
+    }
+
+    /// (x, y PDF, texte brut) de chaque opération de texte du PDF.
+    fn text_ops(pdf: &[u8]) -> Vec<(f32, f32, Vec<u8>)> {
+        let s = String::from_utf8_lossy(pdf).to_string();
+        let mut out = Vec::new();
+        for chunk in s.split("BT /").skip(1) {
+            let Some(td) = chunk.find(" Td (") else {
+                continue;
+            };
+            let nums: Vec<f32> = chunk[..td]
+                .split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            let rest = &chunk[td + 5..];
+            let Some(end) = rest.find(") Tj ET") else {
+                continue;
+            };
+            if nums.len() >= 3 {
+                let n = nums.len();
+                out.push((nums[n - 2], nums[n - 1], rest.as_bytes()[..end].to_vec()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn disk_block_labels_and_values_share_their_line_even_with_empty_serial() {
+        let mut r = sample_record();
+        r.disk.serial = String::new();
+        r.disk.model = "Virtual Disk".into();
+        let ops = text_ops(&render(&r, None));
+        // Libellé « N° de série » (WinAnsi : \260 = °, \351 = é) et la valeur qui suit.
+        let label = b"N\\260 de s\\351rie".to_vec();
+        let i = ops
+            .iter()
+            .position(|o| o.2 == label)
+            .expect("libellé présent");
+        let (lx, ly, _) = &ops[i];
+        let (vx, vy, v) = &ops[i + 1];
+        assert_eq!(ly, vy, "valeur sur la même ligne que son libellé");
+        assert!(vx > lx);
+        assert_eq!(v, b"\\227", "n° de série vide affiché « — »");
+        // Le modèle est sur la ligne au-dessus, à un pas de ROW.
+        let m = ops
+            .iter()
+            .position(|o| o.2 == b"Mod\\350le".to_vec())
+            .unwrap();
+        assert_eq!(ops[m + 1].2, b"Virtual Disk".to_vec());
+        assert!((ops[m].1 - ly - ROW).abs() < 0.01);
     }
 
     #[test]

@@ -139,14 +139,15 @@ impl ProtectContext {
 
 /// Code à saisir : 4 derniers caractères du n° de série (en majuscules).
 /// Si ces 4 caractères sont identiques (ex. « 0000 »), le n° de série COMPLET est exigé.
-/// Sans n° de série : « D<numéro>-<taille en Go> ».
+/// Sans n° de série : « D<numéro>-<taille> », taille en Mo sous 1 Go (« D2-268M »),
+/// sinon en Go (« D3-320G ») — mêmes arrondis que l'affichage de `--list`.
 pub fn confirmation_code(disk: &DiskInfo) -> String {
     let s: Vec<char> = disk.serial.trim().chars().collect();
     if s.is_empty() {
         return format!(
             "D{}-{}",
             disk.number,
-            (disk.size_bytes as f64 / 1e9).round() as u64
+            crate::detect::size_tag(disk.size_bytes)
         );
     }
     let last: String = s[s.len().saturating_sub(4)..]
@@ -237,7 +238,7 @@ pub fn check_allowed(
         return Err(PrepareError(format!(
             "Confirmation incorrecte : saisir {} ({}).",
             if disk.serial.trim().is_empty() {
-                "le code D<n°>-<taille en Go>"
+                "le code D<n°>-<taille> (taille en Mo « M » sous 1 Go, sinon en Go « G »)"
             } else {
                 "le code demandé du n° de série"
             },
@@ -561,10 +562,16 @@ pub(crate) mod tests {
     #[test]
     fn confirmation_without_serial_uses_number_and_size() {
         let d = disk(5, "  ");
-        assert_eq!(confirmation_code(&d), "D5-320");
-        assert!(confirmation_matches(&d, "d5-320"));
+        assert_eq!(confirmation_code(&d), "D5-320G");
+        assert!(confirmation_matches(&d, "d5-320g"));
         assert!(!confirmation_matches(&d, "D5"));
+        assert!(!confirmation_matches(&d, "D5-320"));
         assert_eq!(confirmation_code(&disk(1, "AB")), "AB");
+        // VHD de 256 Mio : taille en Mo, cohérente avec l'affichage « 268 Mo ».
+        let mut vhd = disk(2, "");
+        vhd.size_bytes = 268_435_456;
+        assert_eq!(confirmation_code(&vhd), "D2-268M");
+        assert_eq!(crate::detect::human_size(vhd.size_bytes), "268 Mo");
     }
 
     #[test]

@@ -37,7 +37,8 @@ Usage :
                                             (rien n'est effacé, le disque n'est pas mis hors ligne)
                                             (XXXX = 4 derniers caractères du n° de série ;
                                              n° COMPLET s'ils sont identiques, ex. « 0000 » ;
-                                             D<n°>-<taille en Go> sans n° de série)
+                                             sans n° de série : D<n°>-<taille>, ex. D2-268M
+                                             sous 1 Go, D3-320G au-delà)
   {APP} --erase N --confirm XXXX [options] [--dry-run]
                                             Efface le disque N et produit un certificat PDF
                                             (--dry-run : affiche le plan, n'écrit rien)
@@ -389,7 +390,7 @@ fn run_erase(
         rec.end,
         rec.id,
         rec.status.code(),
-        rec.disk.serial,
+        detect::serial_or_none(&rec.disk.serial),
         pdf_path.display()
     );
     let log = std::fs::OpenOptions::new()
@@ -450,7 +451,7 @@ fn erase_disk(args: &[String], n: &str, cfg: &Config, paths: &Paths) -> Result<i
         "Disque {} : {} — n° de série {} — {}",
         disk.number,
         disk.display_model(),
-        disk.serial,
+        detect::serial_or_none(&disk.serial),
         detect::human_size(disk.size_bytes)
     );
     // Autorisation + verrous des volumes : `prepared` vit jusqu'à la fin de la fonction,
@@ -570,7 +571,7 @@ fn print_disks(disks: &[DiskInfo], ctx: &ProtectContext) {
             "{:<3} {:<28} {:<18} {:>8} {:<6} {:<5} {}{}",
             d.number,
             d.display_model(),
-            d.serial,
+            detect::serial_or_none(&d.serial),
             detect::human_size(d.size_bytes),
             d.bus.to_string(),
             d.media.to_string(),
@@ -601,7 +602,7 @@ fn print_history(paths: &Paths) -> Result<(), String> {
             r.end,
             r.status.code(),
             pdf::fit(&r.disk.model, pdf::Font::Mono, 10.0, 24.0 * 6.0),
-            r.disk.serial,
+            detect::serial_or_none(&r.disk.serial),
             r.customer.name
         );
     }
@@ -692,7 +693,19 @@ fn run(args: &[String]) -> Result<i32, String> {
     Err("commande inconnue (voir --help)".into())
 }
 
+/// Console en UTF-8 (sinon cp850 et accents cassés). Échec ignoré : l'outil continue.
+fn set_console_utf8() {
+    use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+    const CP_UTF8: u32 = 65001;
+    // SAFETY: simples appels sans pointeur ; un échec (pas de console) est sans conséquence.
+    unsafe {
+        let _ = SetConsoleOutputCP(CP_UTF8);
+        let _ = SetConsoleCP(CP_UTF8);
+    }
+}
+
 fn main() {
+    set_console_utf8();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(code) => std::process::exit(code),

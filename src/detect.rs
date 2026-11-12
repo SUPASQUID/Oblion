@@ -332,14 +332,35 @@ pub fn list_disks() -> Result<Vec<DiskInfo>, DetectError> {
     Ok(disks)
 }
 
-/// Formate une taille en Go/To (décimal, comme les fabricants).
+/// Formate une taille en Mo/Go/To (décimal, comme les fabricants).
 pub fn human_size(bytes: u64) -> String {
-    const GB: f64 = 1e9;
     let b = bytes as f64;
     if b >= 1e12 {
         format!("{:.1} To", b / 1e12)
+    } else if b >= 1e9 {
+        format!("{:.0} Go", b / 1e9)
     } else {
-        format!("{:.0} Go", b / GB)
+        format!("{:.0} Mo", b / 1e6)
+    }
+}
+
+/// Taille courte pour le code de confirmation : « 268M » sous 1 Go, sinon « 320G »
+/// (mêmes arrondis que `human_size` en Mo/Go).
+pub fn size_tag(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9 {
+        format!("{:.0}G", b / 1e9)
+    } else {
+        format!("{:.0}M", b / 1e6)
+    }
+}
+
+/// N° de série pour la console : « (aucun) » s'il est vide.
+pub fn serial_or_none(serial: &str) -> &str {
+    if serial.trim().is_empty() {
+        "(aucun)"
+    } else {
+        serial
     }
 }
 
@@ -444,5 +465,10 @@ mod tests {
     fn formats_sizes() {
         assert_eq!(human_size(320_072_933_376), "320 Go");
         assert_eq!(human_size(1_000_204_886_016), "1.0 To");
+        assert_eq!(human_size(268_435_456), "268 Mo");
+        assert_eq!(size_tag(268_435_456), "268M");
+        assert_eq!(size_tag(320_072_933_376), "320G");
+        assert_eq!(serial_or_none("  "), "(aucun)");
+        assert_eq!(serial_or_none("ZX9K4T17"), "ZX9K4T17");
     }
 }

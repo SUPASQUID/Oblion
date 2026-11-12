@@ -1,12 +1,12 @@
 # DiskErase
 
 > ⚠️ **Outil DESTRUCTIF — version de développement (pré-alpha).**
-> L'effacement d'un disque physique n'a **pas encore été validé sur du matériel réel**.
+> L'effacement a été validé sur un **disque virtuel (VHD)**, mais **pas encore sur du matériel réel**.
 > N'utilisez pas cet outil sur un disque contenant des données à conserver.
 > Utilisation à vos risques, sans aucune garantie (voir [LICENSE](LICENSE)).
 >
 > ⚠️ **DESTRUCTIVE tool — development version (pre-alpha).** Physical-disk erasure has **not yet
-> been validated on real hardware**. Use at your own risk, without any warranty.
+> been validated on real hardware** yet (validated on a virtual VHD disk only). Use at your own risk, without any warranty.
 
 ## Français
 
@@ -19,7 +19,7 @@ Projet étudiant (BTS SIO). Nom provisoire.
 | Étape | Contenu | État |
 |---|---|---|
 | 1 | Détection des disques + sécurités (disque système et clé protégés, confirmation par n° de série, `--dry-run`) | fait, testé en lecture seule |
-| 2 | Effacement HDD par écrasement (DoD 5220.22-M, vérification, reprise sur erreur) + certificat PDF + historique JSON/CSV | fait, testé sur fichier uniquement |
+| 2 | Effacement HDD par écrasement (DoD 5220.22-M, vérification, reprise sur erreur) + certificat PDF + historique JSON/CSV | fait, testé sur fichier et sur disque virtuel VHD (verrouillage des volumes avec/sans lettre, mise hors ligne, écriture brute, vérification, remise en ligne) |
 | 3 | SSD SATA/NVMe (Sanitize, Secure Erase), SMART, HPA/DCO | à faire |
 | 4 | Interface graphique (sans GPU) | à faire |
 | 5 | Zip portable, CI GitHub Actions, releases signées SHA256 | à faire |

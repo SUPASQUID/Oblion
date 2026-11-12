@@ -241,6 +241,10 @@ pub(crate) struct Job<'a> {
     done_work: u64,
     samples: Vec<(f32, f32)>,
     moved_total: u64,
+    /// Passe en cours (phase, index) et instant de son début, pour le débit provisoire.
+    pass_key: Option<(Phase, usize)>,
+    pass_start: Instant,
+    last_tick: Instant,
 }
 
 impl<'a> Job<'a> {
@@ -260,6 +264,11 @@ impl<'a> Job<'a> {
         self.done_work += n;
         self.win_bytes += n;
         self.moved_total += n;
+        // Nouvelle passe : elle a commencé à la fin du traitement précédent.
+        if self.pass_key != Some((phase, pass_index)) {
+            self.pass_key = Some((phase, pass_index));
+            self.pass_start = self.last_tick;
+        }
         let el = self.win_start.elapsed();
         if el >= SAMPLE_WINDOW {
             self.last_speed = self.win_bytes as f64 / el.as_secs_f64() / 1e6;
@@ -268,13 +277,21 @@ impl<'a> Job<'a> {
             self.win_start = Instant::now();
             self.win_bytes = 0;
         }
+        // Tant qu'aucune fenêtre de 500 ms n'est complète : débit moyen depuis le début de la passe.
+        let speed = if self.samples.is_empty() {
+            let secs = self.pass_start.elapsed().as_secs_f64().max(1e-6);
+            done as f64 / secs / 1e6
+        } else {
+            self.last_speed
+        };
+        self.last_tick = Instant::now();
         (self.cb)(&Progress {
             phase,
             pass_index,
             pass_total: self.pass_total,
             done,
             total,
-            speed_mb_s: self.last_speed,
+            speed_mb_s: speed,
             errors: self.errors,
         });
     }
@@ -381,6 +398,9 @@ pub fn erase(
         done_work: 0,
         samples: Vec::new(),
         moved_total: 0,
+        pass_key: None,
+        pass_start: now,
+        last_tick: now,
     };
 
     let mut wbuf = AlignedBuf::new(chunk);
@@ -785,6 +805,25 @@ pub(crate) mod tests {
         );
         assert!(o.aborted);
         assert!(o.bytes_erased < 64 * 1024, "{}", o.bytes_erased);
+    }
+
+    #[test]
+    fn progress_speed_is_not_zero_before_the_first_window() {
+        // Disque minuscule : aucune fenêtre de 500 ms ne se termine, le débit affiché
+        // doit quand même être le débit moyen de la passe (> 0), et fini.
+        let mut d = MemDisk::new(64 * 1024);
+        let mut speeds = Vec::new();
+        erase(
+            &mut d,
+            &small_plan(vec![Fill::Byte(0), Fill::Byte(1)], VerifyMode::Last),
+            &AtomicBool::new(false),
+            &mut |p| speeds.push(p.speed_mb_s),
+        );
+        assert!(!speeds.is_empty());
+        assert!(
+            speeds.iter().all(|s| s.is_finite() && *s > 0.0),
+            "{speeds:?}"
+        );
     }
 
     #[test]
