@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+# Runtime C lié statiquement : aucun VC++ redistribuable requis (WinPE / Windows vierge)
+rustflags = ["-C", "target-feature=+crt-static"]

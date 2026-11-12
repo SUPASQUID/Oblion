@@ -1,0 +1,26 @@
+[package]
+name = "diskerase"
+version = "0.1.0"
+edition = "2021"
+description = "Outil portable d'effacement sécurisé de disques (HDD/SSD) avec certificat PDF"
+license = "MIT"
+publish = false
+
+[dependencies]
+barcoders = { version = "2.0.0", default-features = false, features = ["std"] }
+png = "0.18.1"
+qrcode = { version = "0.14.1", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.2.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Registry", "Win32_System_SystemInformation"] }
+# printpdf, GUI, etc. ajoutés au fil des étapes
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# panic = "unwind" (défaut) : en cas de panique, les gardes s'exécutent
+# (remise en ligne du disque, déverrouillage des volumes).
+

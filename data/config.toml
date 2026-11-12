@@ -1,0 +1,13 @@
+# Valeurs par défaut lues par le certificat PDF
+[company]
+name = ""
+address = ""
+contact_name = ""
+phone = ""
+
+[technician]
+name = ""
+
+[erase]
+hdd_passes = ["0x00", "0xFF", "random"]
+verify = "last"   # last | all | none

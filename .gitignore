@@ -1,0 +1,13 @@
+/target
+/dist
+# Données produites à l'utilisation (certificats, historique, journaux)
+data/certificates/*
+data/history/*
+data/logs/*
+!data/**/.gitkeep
+# Maquette et rapports de référence privés (contiennent des n° de série réels)
+/design-src/
+*.pdb
+*.img
+*.vhd
+*.vhdx
