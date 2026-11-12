@@ -1,21 +1,25 @@
 //! Point d'entrée. Mode console (l'interface graphique arrive à l'étape 4).
 mod app;
+mod ata;
 mod certificate;
 mod clock;
 mod config;
 mod detect;
 mod erase_hdd;
 mod erase_ssd;
+mod hpa;
+mod nvme;
 mod pdf;
 mod rawdisk;
 mod report;
 mod safety;
+mod smart;
 mod ui;
 mod verify;
 mod winio;
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -24,12 +28,17 @@ use clock::DateTime;
 use config::{Config, Customer, CustomerOverride, Paths, Technician};
 use detect::{Bus, DiskInfo, MediaType};
 use erase_hdd::{BlockDevice, Fill, Phase, Plan, Progress, VerifyMode};
-use report::{MethodKind, RecordInput, Status};
+use erase_ssd::{Decision, FwMethod, MethodOpt, Probe};
+use hpa::Hidden;
+use report::{EraseRecord, FirmwareKind, FirmwareReport, MethodKind, RecordInput, Status};
 use safety::ProtectContext;
 
 const USAGE: &str = "\
 Usage :
   {APP} --list                              Liste les disques détectés
+  {APP} --info N                            LECTURE SEULE : IDENTIFY ATA ou Identify NVMe, sécurité
+                                            (gel…), capacités Sanitize, TRIM, HPA/DCO, SMART, et la
+                                            méthode qui serait choisie (droits administrateur requis)
   {APP} --prepare N --confirm XXXX [--dry-run]
                                             TEST de préparation : vérifie les règles puis
                                             verrouille et démonte les volumes du disque N ;
@@ -41,8 +50,9 @@ Usage :
                                              sous 1 Go, D3-320G au-delà)
   {APP} --erase N --confirm XXXX [options] [--dry-run]
                                             Efface le disque N et produit un certificat PDF
-                                            (--dry-run : affiche le plan, n'écrit rien)
-  {APP} --erase-file <fichier> [options]    Même chaîne sur un fichier de test
+                                            (--dry-run : lit les capacités en lecture seule,
+                                             affiche la méthode choisie et pourquoi, n'écrit rien)
+  {APP} --erase-file <fichier> [options]    Même chaîne (écrasement) sur un fichier de test
                                             (certificat marqué « TEST SUR FICHIER »)
   {APP} --history                           Liste les effacements enregistrés
   {APP} --export-csv <fichier.csv>          Exporte l'historique en CSV (Excel)
@@ -50,6 +60,22 @@ Usage :
   {APP} --version | --help
 
 Options d'effacement :
+  --method auto|firmware|overwrite
+                                auto (défaut) : commande firmware si possible (NIST Purge),
+                                  sinon écrasement DoD pour un HDD ;
+                                  SSD SATA : Sanitize Crypto > Sanitize Block > Security Erase
+                                  Enhanced > Normal ; NVMe : Sanitize Crypto > Block > Format
+                                  NVM SES=2 > SES=1 ; HDD : Sanitize Crypto/Overwrite > Security
+                                  Erase > DoD.
+                                firmware : commande firmware uniquement.
+                                overwrite : écrasement (SSD/NVMe : statut au mieux PARTIAL).
+                                Purge n'est accordé que si la commande réussit ET que les
+                                marqueurs posés avant (~1000 secteurs) sont tous effacés.
+                                Disque gelé (frozen) : rien n'est tenté, un guide s'affiche.
+  --allow-fallback              Si la commande firmware échoue ou est refusée (ou s'il n'y en
+                                a aucune) : TRIM complet + écrasement 1 passe aléatoire +
+                                vérification complète (NIST Clear, statut au mieux PARTIAL).
+                                Sans cette option : arrêt et certificat FAILED.
   --passes 0x00,0xFF,random     Motifs des passes (défaut : config.toml, DoD 5220.22-M)
   --verify last|all|none        Vérification (défaut : config.toml)
   --client <id>                 Client du carnet data/clients.toml
@@ -60,13 +86,17 @@ Options d'effacement :
                                 (les --customer-* remplacent champ par champ ceux de --client)
   --tag \"…\"                     Étiquette libre (n° d'inventaire…)
   --technician \"…\"              Technicien (défaut : config.toml)
-  --force-overwrite-ssd         Autorise l'écrasement d'un SSD/NVMe (ou type inconnu).
-                                Refusé par défaut : l'écrasement ne garantit pas l'effacement
-                                d'un SSD (sur-provisionnement). Statut au mieux PARTIAL.
+  --force-overwrite-ssd         Alias de --method overwrite pour un SSD/NVMe (ou type inconnu) :
+                                l'écrasement ne garantit pas l'effacement d'un SSD
+                                (sur-provisionnement). Statut au mieux PARTIAL.
 
-Ce programme est DESTRUCTIF. --dry-run n'écrit et ne modifie rien.
-Ctrl+C (ou fermeture de la fenêtre) interrompt proprement : un certificat « ABORTED »
-est quand même produit.";
+Le certificat contient le SMART lu AVANT l'effacement et l'état HPA/DCO (détection seule :
+les zones cachées ne sont jamais modifiées ; si elles existent, un écrasement ou un Security
+Erase donne au mieux PARTIAL, Sanitize couvre tout le support).
+
+Ce programme est DESTRUCTIF. --dry-run et --info n'écrivent et ne modifient rien.
+Ctrl+C (ou fermeture de la fenêtre) interrompt proprement un écrasement : un certificat
+« ABORTED » est quand même produit. Une commande firmware déjà lancée se termine dans le disque.";
 
 // ---------- Arguments ----------
 
@@ -92,6 +122,8 @@ struct EraseOpts {
     tag: String,
     dry_run: bool,
     force_ssd: bool,
+    method: MethodOpt,
+    allow_fallback: bool,
 }
 
 /// Cible de l'effacement, pour le certificat.
@@ -99,18 +131,22 @@ struct Target {
     notes: Vec<String>,
     test_target: bool,
     ssd_overwrite: bool,
+    smart: Option<report::SmartInfo>,
+    hidden: Hidden,
+    real_size: Option<u64>,
 }
 
-const SSD_REFUSED: &str = "l'écrasement ne garantit pas l'effacement d'un SSD ; Sanitize/Secure Erase arrive à l'étape 3 \
-     (option --force-overwrite-ssd pour écraser quand même, statut au mieux PARTIAL)";
-
-/// Écrasement autorisé ? Ok(true) = écrasement forcé sur SSD/NVMe/inconnu.
-fn ssd_policy(media: MediaType, force: bool) -> Result<bool, String> {
-    match media {
-        MediaType::Hdd => Ok(false),
-        _ if force => Ok(true),
-        other => Err(format!("disque de type {other} : {SSD_REFUSED}")),
+/// Méthode effective : --force-overwrite-ssd = --method overwrite pour un support non magnétique.
+fn method_opt(method: MethodOpt, force_ssd: bool, media: MediaType) -> Result<MethodOpt, String> {
+    if force_ssd {
+        if method == MethodOpt::Firmware {
+            return Err("--force-overwrite-ssd et --method firmware sont incompatibles".into());
+        }
+        if media != MediaType::Hdd {
+            return Ok(MethodOpt::Overwrite);
+        }
     }
+    Ok(method)
 }
 
 fn seed() -> u64 {
@@ -158,54 +194,59 @@ fn erase_opts(args: &[String], cfg: &Config, paths: &Paths) -> Result<EraseOpts,
         Some(name) => Technician { name },
         None => cfg.technician.clone(),
     };
+    let method = match opt(args, "--method")? {
+        Some(m) => MethodOpt::parse(&m)?,
+        None => MethodOpt::Auto,
+    };
+    let force_ssd = has(args, "--force-overwrite-ssd");
+    if force_ssd && method == MethodOpt::Firmware {
+        return Err("--force-overwrite-ssd et --method firmware sont incompatibles".into());
+    }
     Ok(EraseOpts {
         plan,
         customer: base.merged(&over),
         technician,
         tag: opt(args, "--tag")?.unwrap_or_default(),
         dry_run: has(args, "--dry-run"),
-        force_ssd: has(args, "--force-overwrite-ssd"),
+        force_ssd,
+        method,
+        allow_fallback: has(args, "--allow-fallback"),
     })
 }
 
-fn describe_plan(o: &EraseOpts) {
+fn describe_people(o: &EraseOpts) {
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "—".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    println!("Client        : {}", dash(&o.customer.name));
+    println!("Technicien    : {}", dash(&o.technician.name));
+    if !o.tag.is_empty() {
+        println!("Tag           : {}", o.tag);
+    }
+}
+
+fn describe_plan(plan: &Plan) {
     println!(
         "Méthode       : {} (NIST 800-88 : {})",
-        report::method_label(&o.plan),
+        report::method_label(plan),
         MethodKind::Overwrite.level()
     );
-    if o.plan.verify == VerifyMode::None {
+    if plan.verify == VerifyMode::None {
         println!("ATTENTION     : sans vérification, le statut sera au mieux PARTIAL");
     }
     println!(
         "Passes        : {}",
-        o.plan
-            .passes
+        plan.passes
             .iter()
             .map(Fill::label)
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!("Vérification  : {}", o.plan.verify.label());
-    println!(
-        "Client        : {}",
-        if o.customer.name.is_empty() {
-            "—"
-        } else {
-            &o.customer.name
-        }
-    );
-    println!(
-        "Technicien    : {}",
-        if o.technician.name.is_empty() {
-            "—"
-        } else {
-            &o.technician.name
-        }
-    );
-    if !o.tag.is_empty() {
-        println!("Tag           : {}", o.tag);
-    }
+    println!("Vérification  : {}", plan.verify.label());
 }
 
 // ---------- Ctrl+C ----------
@@ -290,6 +331,22 @@ fn print_progress(p: &Progress) {
     let _ = std::io::stdout().flush();
 }
 
+/// Progression limitée à 5 affichages par seconde.
+fn throttled_progress() -> impl FnMut(&Progress) {
+    let mut last = Instant::now() - Duration::from_secs(1);
+    move |p: &Progress| {
+        if last.elapsed() >= Duration::from_millis(200) || p.done == p.total {
+            print_progress(p);
+            last = Instant::now();
+        }
+    }
+}
+
+fn print_status(s: &str) {
+    print!("\r{s:<70}");
+    let _ = std::io::stdout().flush();
+}
+
 fn load_logo(paths: &Paths) -> Option<pdf::Image> {
     let path = paths.assets.join("logo.png");
     let bytes = std::fs::read(&path).ok()?;
@@ -302,59 +359,46 @@ fn load_logo(paths: &Paths) -> Option<pdf::Image> {
     }
 }
 
-/// Lance l'effacement, écrit le certificat et l'historique. Renvoie le code de sortie.
-fn run_erase(
-    dev: &mut dyn BlockDevice,
-    disk: &DiskInfo,
-    o: EraseOpts,
+/// Champs communs d'un RecordInput.
+#[allow(clippy::too_many_arguments)]
+fn record_input<'a>(
+    disk: &'a DiskInfo,
+    plan: &'a Plan,
+    outcome: &'a erase_hdd::Outcome,
+    kind: MethodKind,
+    o: &EraseOpts,
     cfg: &Config,
-    paths: &Paths,
-    target: Target,
-) -> Result<i32, String> {
-    // Arrêt demandé pendant la préparation : on n'a encore rien écrit, pas de certificat.
-    if CANCEL.load(Ordering::SeqCst) {
-        return Err("interrompu avant le début de l'effacement : rien n'a été écrit".into());
-    }
-    let mut notes = target.notes;
-    println!("Taille effacée : {} octets", dev.size());
-    let start = DateTime::now();
-    let mut last = Instant::now() - Duration::from_secs(1);
-    let outcome = erase_hdd::erase(dev, &o.plan, &CANCEL, &mut |p| {
-        if last.elapsed() >= Duration::from_millis(200) || p.done == p.total {
-            print_progress(p);
-            last = Instant::now();
-        }
-    });
-    let end = DateTime::now();
-    println!();
-
-    if let Some(r) = &outcome.abort_reason {
-        notes.push(format!("Arrêt : {r}"));
-    } else if outcome.aborted {
-        notes.push("Effacement interrompu par l'opérateur (Ctrl+C)".to_string());
-    }
-
-    let rec = report::build_record(RecordInput {
+    start: DateTime,
+    notes: Vec<String>,
+    target: &Target,
+) -> RecordInput<'a> {
+    RecordInput {
         disk,
-        plan: &o.plan,
-        outcome: &outcome,
-        kind: MethodKind::Overwrite,
+        plan,
+        outcome,
+        kind,
         degraded: false,
         org: cfg.company.clone(),
-        technician: o.technician,
-        customer: o.customer,
-        tag: o.tag,
+        technician: o.technician.clone(),
+        customer: o.customer.clone(),
+        tag: o.tag.clone(),
         start,
-        end,
+        end: DateTime::now(),
         notes,
-        smart: None,
+        smart: target.smart.clone(),
         test_target: target.test_target,
         ssd_overwrite: target.ssd_overwrite,
-    });
+        hidden: target.hidden.clone(),
+        real_size: target.real_size,
+        firmware: None,
+    }
+}
 
-    let pdf_bytes = certificate::render(&rec, load_logo(paths));
-    // Jamais d'écrasement d'un certificat existant : suffixe -2, -3… si le nom est pris.
-    let mut pdf_path = paths.certificates.join(format!("{}.pdf", rec.id));
+/// Écrit le certificat (jamais d'écrasement d'un fichier existant), l'historique et le
+/// journal, affiche le résumé. Renvoie le code de sortie.
+fn finish(rec: &EraseRecord, paths: &Paths) -> Result<i32, String> {
+    let pdf_bytes = certificate::render(rec, load_logo(paths));
+    let mut pdf_path: PathBuf = paths.certificates.join(format!("{}.pdf", rec.id));
     let mut k = 2;
     let mut file = loop {
         match std::fs::OpenOptions::new()
@@ -383,16 +427,24 @@ fn run_erase(
                 pdf_path.display()
             )
         })?;
-    report::append_history(&paths.history, &rec)?;
-    // Journal texte (une ligne par effacement) ; non bloquant.
-    let line = format!(
-        "{} {} {} {} {}\n",
+    report::append_history(&paths.history, rec)?;
+    // Journal texte (une ligne par effacement + notes critiques) ; non bloquant.
+    let mut line = format!(
+        "{} {} {} {} {} {}\n",
         rec.end,
         rec.id,
         rec.status.code(),
         detect::serial_or_none(&rec.disk.serial),
+        rec.method,
         pdf_path.display()
     );
+    for n in rec
+        .notes
+        .iter()
+        .filter(|n| n.starts_with("DISQUE VERROUILLÉ") || n.starts_with("REPLI"))
+    {
+        line.push_str(&format!("    {n}\n"));
+    }
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -401,12 +453,22 @@ fn run_erase(
         eprintln!("ATTENTION : journal non écrit ({e})");
     }
 
+    for n in rec
+        .notes
+        .iter()
+        .filter(|n| n.starts_with("DISQUE VERROUILLÉ"))
+    {
+        eprintln!("ATTENTION : {n}");
+    }
     println!(
         "Statut        : {} ({}) — NIST 800-88 : {}",
         rec.status.code(),
         rec.status.fr(),
         rec.level
     );
+    println!("Méthode       : {}", rec.method);
+    println!("Vérification  : {} ({})", rec.verify, rec.verify_result);
+    println!("HPA/DCO       : {}", rec.hpa_dco);
     println!(
         "Octets effacés: {} / {} ({:.2} %)",
         rec.bytes_erased, rec.disk.size_bytes, rec.percent
@@ -418,6 +480,324 @@ fn run_erase(
     );
     println!("Certificat    : {}", pdf_path.display());
     Ok(if rec.status == Status::Erased { 0 } else { 2 })
+}
+
+/// Écrasement (moteur HDD), certificat et historique.
+fn run_erase(
+    dev: &mut dyn BlockDevice,
+    disk: &DiskInfo,
+    o: &EraseOpts,
+    cfg: &Config,
+    paths: &Paths,
+    target: Target,
+) -> Result<i32, String> {
+    // Arrêt demandé pendant la préparation : on n'a encore rien écrit, pas de certificat.
+    if CANCEL.load(Ordering::SeqCst) {
+        return Err("interrompu avant le début de l'effacement : rien n'a été écrit".into());
+    }
+    let mut notes = target.notes.clone();
+    println!("Taille effacée : {} octets", dev.size());
+    let start = DateTime::now();
+    let outcome = erase_hdd::erase(dev, &o.plan, &CANCEL, &mut throttled_progress());
+    println!();
+    if let Some(r) = &outcome.abort_reason {
+        notes.push(format!("Arrêt : {r}"));
+    } else if outcome.aborted {
+        notes.push("Effacement interrompu par l'opérateur (Ctrl+C)".to_string());
+    }
+    let rec = report::build_record(record_input(
+        disk,
+        &o.plan,
+        &outcome,
+        MethodKind::Overwrite,
+        o,
+        cfg,
+        start,
+        notes,
+        &target,
+    ));
+    finish(&rec, paths)
+}
+
+/// Repli Clear (TRIM + 1 passe aléatoire + vérification) puis certificat.
+#[allow(clippy::too_many_arguments)]
+fn run_fallback_erase(
+    dev: &mut rawdisk::RawDisk,
+    disk: &DiskInfo,
+    mut report: FirmwareReport,
+    trim: bool,
+    o: &EraseOpts,
+    cfg: &Config,
+    paths: &Paths,
+    target: &Target,
+    mut notes: Vec<String>,
+    start: DateTime,
+) -> Result<i32, String> {
+    println!(
+        "Repli Clear : {}écrasement 1 passe aléatoire + vérification complète",
+        if trim { "TRIM complet + " } else { "" }
+    );
+    let plan = erase_ssd::fallback_plan(o.plan.seed);
+    let (fb, outcome) =
+        erase_ssd::run_fallback(dev, trim, &plan, &CANCEL, &mut throttled_progress());
+    println!();
+    match &fb.trim {
+        Some(Ok(())) => notes.push("TRIM complet : OK".into()),
+        Some(Err(e)) => notes.push(format!("TRIM refusé : {e}")),
+        None => notes.push("TRIM non supporté ou non signalé : non effectué".into()),
+    }
+    if let Some(r) = &outcome.abort_reason {
+        notes.push(format!("Arrêt : {r}"));
+    } else if outcome.aborted {
+        notes.push("Effacement interrompu par l'opérateur (Ctrl+C)".to_string());
+    }
+    report.fallback = Some(fb);
+    let mut input = record_input(
+        disk,
+        &plan,
+        &outcome,
+        MethodKind::Overwrite,
+        o,
+        cfg,
+        start,
+        notes,
+        target,
+    );
+    input.ssd_overwrite = false;
+    input.firmware = Some(report);
+    finish(&report::build_record(input), paths)
+}
+
+/// Commande firmware avec vérification par marqueurs ; repli si demandé.
+#[allow(clippy::too_many_arguments)]
+fn run_firmware_erase(
+    dev: &mut rawdisk::RawDisk,
+    disk: &DiskInfo,
+    m: FwMethod,
+    probe: &Probe,
+    media: MediaType,
+    o: &EraseOpts,
+    cfg: &Config,
+    paths: &Paths,
+    target: Target,
+) -> Result<i32, String> {
+    if CANCEL.load(Ordering::SeqCst) {
+        return Err("interrompu avant le début de l'effacement : rien n'a été écrit".into());
+    }
+    let start = DateTime::now();
+    let t0 = Instant::now();
+    println!("Méthode firmware : {m}");
+    println!(
+        "(Ctrl+C n'arrête pas une commande firmware déjà lancée : le disque la termine seul.)"
+    );
+    let ctx = erase_ssd::FwContext {
+        method: m,
+        media,
+        caps: &probe.caps,
+        seed: o.plan.seed,
+        markers: erase_ssd::MARKER_COUNT,
+        poll: Duration::from_secs(5),
+        cancel: &CANCEL,
+    };
+    let run = erase_ssd::run_firmware(dev, &ctx, &mut std::thread::sleep, &mut print_status);
+    println!();
+    for l in &run.log {
+        println!("  {l}");
+    }
+    for c in &run.report.critical {
+        eprintln!("ATTENTION : {c}");
+    }
+    let mut notes = target.notes.clone();
+    notes.extend(run.notes.iter().cloned());
+    let cancelled = CANCEL.load(Ordering::SeqCst);
+
+    if run.failed() && run.attempted && run.maybe_busy {
+        eprintln!("ATTENTION : {}", erase_ssd::NOTE_NO_FALLBACK_BUSY);
+        notes.insert(0, erase_ssd::NOTE_NO_FALLBACK_BUSY.to_string());
+    } else if run.failed() && !o.allow_fallback {
+        notes.push("Repli non autorisé (option --allow-fallback absente)".into());
+    }
+    if run.fallback_allowed(o.allow_fallback) && !cancelled {
+        return run_fallback_erase(
+            dev,
+            disk,
+            run.report.clone(),
+            probe.caps.trim(),
+            o,
+            cfg,
+            paths,
+            &target,
+            notes,
+            start,
+        );
+    }
+    let mut outcome = erase_ssd::firmware_outcome(dev.size(), &run, t0.elapsed());
+    if cancelled && !run.attempted {
+        outcome.aborted = true;
+        notes.push("Interrompu par l'opérateur avant la commande firmware (marqueurs éventuellement écrits)".into());
+    }
+    let mut input = record_input(
+        disk,
+        &o.plan,
+        &outcome,
+        MethodKind::Firmware,
+        o,
+        cfg,
+        start,
+        notes,
+        &target,
+    );
+    input.ssd_overwrite = false;
+    input.firmware = Some(run.report.clone());
+    finish(&report::build_record(input), paths)
+}
+
+// ---------- Lecture des capacités (lecture seule) ----------
+
+fn probe_disk(disk: &DiskInfo) -> Probe {
+    let mut p = if disk.bus == Bus::Nvme {
+        match nvme::ReadOnlyNvme::open(disk.number) {
+            Ok(mut port) => erase_ssd::probe_nvme(&mut port),
+            Err(e) => Probe {
+                hidden: Hidden::NotApplicable("NVMe : pas de HPA/DCO".into()),
+                errors: vec![e],
+                ..Default::default()
+            },
+        }
+    } else {
+        match ata::ReadOnlyAta::open(disk.number) {
+            Ok(mut port) => erase_ssd::probe_ata(&mut port),
+            Err(e) => Probe {
+                hidden: Hidden::Unreadable(e.clone()),
+                errors: vec![e],
+                ..Default::default()
+            },
+        }
+    };
+    p.caps.trim_property = detect::trim_enabled(disk.number);
+    p
+}
+
+fn print_probe(p: &Probe, media: MediaType, smart_table: bool) {
+    if let Some(id) = &p.caps.ata {
+        println!("--- ATA IDENTIFY ---");
+        println!("Modèle        : {}", id.model);
+        println!("N° de série   : {}", id.serial);
+        println!("Firmware      : {}", id.firmware);
+        println!(
+            "Capacité      : {} secteurs × {} octets = {} ({}48 bits)",
+            id.sectors,
+            id.logical_sector,
+            detect::human_size(id.sectors * id.logical_sector as u64),
+            if id.lba48 { "" } else { "pas de " }
+        );
+        println!(
+            "Rotation      : {}",
+            match id.rotation {
+                ata::Rotation::NonRotating => "aucune (SSD)".to_string(),
+                ata::Rotation::Rpm(r) => format!("{r} tr/min"),
+                _ => "non rapportée".to_string(),
+            }
+        );
+        println!(
+            "TRIM          : {} (lecture déterministe après TRIM {}, zéros {})",
+            if id.trim { "oui" } else { "non" },
+            if id.drat { "oui" } else { "non" },
+            if id.rzat { "oui" } else { "non" }
+        );
+    }
+    if let Some(c) = &p.caps.nvme {
+        println!("--- NVMe Identify ---");
+        println!("Modèle        : {}", c.model);
+        println!("N° de série   : {}", c.serial);
+        println!("Firmware      : {}", c.firmware);
+        if c.tnvmcap > 0 {
+            println!("Capacité NVM  : {}", smart::human_bytes(c.tnvmcap));
+        }
+        println!("Espaces noms  : {}", c.namespaces);
+        println!("DSM (TRIM)    : {}", if c.dsm { "oui" } else { "non" });
+    }
+    if let Some(ns) = &p.caps.nvme_ns {
+        println!(
+            "Namespace 1   : {} blocs × {} octets = {} (format LBA {})",
+            ns.nsze,
+            ns.lba_size,
+            detect::human_size(ns.size_bytes()),
+            ns.lbaf_index
+        );
+    }
+    if let Some(l) = &p.nvme_sanitize {
+        println!(
+            "Sanitize (81h): état {:?}, progression {}",
+            l.state,
+            l.progress_text()
+        );
+    }
+    println!("HPA/DCO       : {}", p.hidden.label());
+    if let Some(r) = p.real_size {
+        println!("Taille réelle : {} ({r} octets)", detect::human_size(r));
+    }
+    if let Some(s) = &p.smart {
+        println!("--- SMART (santé : {}) ---", s.health);
+        for (k, v) in &s.info {
+            println!("  {k:<26}: {v}");
+        }
+        if smart_table && !s.attrs.is_empty() {
+            println!(
+                "  {:>3} {:<26} {:>6} {:>5} {:>5} {:>6}  Brut",
+                "ID", "Nom", "Flags", "Val", "Pire", "Seuil"
+            );
+            for a in &s.attrs {
+                println!(
+                    "  {:>3} {:<26} {:>6} {:>5} {:>5} {:>6}  {}{}",
+                    a.id,
+                    a.name,
+                    a.flags,
+                    a.value,
+                    a.worst,
+                    a.thresh,
+                    a.raw,
+                    if a.failing { "  <-- EN DÉFAUT" } else { "" }
+                );
+            }
+        }
+    }
+    if !p.errors.is_empty() {
+        println!("--- Lectures en échec ---");
+        for e in &p.errors {
+            println!("  {e}");
+        }
+    }
+    let choice = erase_ssd::choose(&p.caps, media, p.caps.frozen());
+    println!("--- Capacités d'effacement ({media}) ---");
+    for l in erase_ssd::explain(&p.caps, media, &choice) {
+        println!("  {l}");
+    }
+}
+
+fn info_disk(n: &str) -> Result<i32, String> {
+    let n: u32 = n
+        .parse()
+        .map_err(|_| "numéro de disque invalide".to_string())?;
+    let disks = list_disks()?;
+    let disk = disks
+        .iter()
+        .find(|d| d.number == n)
+        .ok_or("disque introuvable")?;
+    println!(
+        "Disque {} : {} — n° de série {} — {} — bus {} — type {}",
+        disk.number,
+        disk.display_model(),
+        detect::serial_or_none(&disk.serial),
+        detect::human_size(disk.size_bytes),
+        disk.bus,
+        disk.media
+    );
+    println!("(lecture seule : aucune commande d'écriture ni d'effacement n'est envoyée)");
+    let p = probe_disk(disk);
+    let media = erase_ssd::effective_media(disk.media, p.caps.ata.as_ref());
+    print_probe(&p, media, true);
+    Ok(0)
 }
 
 fn erase_disk(args: &[String], n: &str, cfg: &Config, paths: &Paths) -> Result<i32, String> {
@@ -440,13 +820,6 @@ fn erase_disk(args: &[String], n: &str, cfg: &Config, paths: &Paths) -> Result<i
         eprintln!("ATTENTION : {w}");
     }
     safety::check_allowed(disk, &ctx, &code).map_err(|e| e.to_string())?;
-    let ssd_overwrite = ssd_policy(disk.media, o.force_ssd)?;
-    if ssd_overwrite {
-        eprintln!(
-            "ATTENTION : {} — écrasement forcé, statut au mieux PARTIAL",
-            report::NOTE_SSD
-        );
-    }
     println!(
         "Disque {} : {} — n° de série {} — {}",
         disk.number,
@@ -454,30 +827,126 @@ fn erase_disk(args: &[String], n: &str, cfg: &Config, paths: &Paths) -> Result<i
         detect::serial_or_none(&disk.serial),
         detect::human_size(disk.size_bytes)
     );
+
+    // Capacités, SMART et HPA/DCO : lus AVANT l'effacement, en lecture seule.
+    let probe = probe_disk(disk);
+    let media = erase_ssd::effective_media(disk.media, probe.caps.ata.as_ref());
+    print_probe(&probe, media, false);
+    let mopt = method_opt(o.method, o.force_ssd, media)?;
+    let choice = erase_ssd::choose(&probe.caps, media, probe.caps.frozen());
+    let decision = erase_ssd::decide(mopt, o.allow_fallback, media, &choice);
+    println!("--- Décision ---");
+    match &decision {
+        Decision::Refuse(e) => return Err(e.clone()),
+        Decision::Frozen(guide) => {
+            eprintln!("{guide}");
+            return Err("disque gelé : rien n'a été tenté".into());
+        }
+        Decision::Firmware(m) => println!(
+            "Méthode       : {m} (NIST 800-88 : Purge si la commande réussit ET que tous les marqueurs sont effacés)\n\
+             Vérification  : {} marqueurs (début, fin, positions aléatoires) écrits avant, relus après{}",
+            erase_ssd::MARKER_COUNT + 2,
+            if o.allow_fallback {
+                "\nRepli         : autorisé (TRIM + 1 passe aléatoire + vérification, statut au mieux PARTIAL)"
+            } else {
+                "\nRepli         : non autorisé (échec = certificat FAILED)"
+            }
+        ),
+        Decision::Fallback => println!(
+            "Méthode       : Repli Clear — TRIM {}+ écrasement 1 passe aléatoire + vérification complète (statut au mieux PARTIAL)",
+            if probe.caps.trim() { "" } else { "(non supporté) " }
+        ),
+        Decision::Overwrite { ssd, note } => {
+            describe_plan(&o.plan);
+            if *ssd {
+                eprintln!(
+                    "ATTENTION : {} — écrasement forcé, statut au mieux PARTIAL",
+                    report::NOTE_SSD
+                );
+            }
+            if let Some(n) = note {
+                eprintln!("ATTENTION : {n}");
+                eprintln!("{}", erase_ssd::FROZEN_GUIDE);
+            }
+            match probe.hidden.hidden_sectors() {
+                Some(n) if n > 0 => eprintln!(
+                    "ATTENTION : {} — l'écrasement ne les atteint pas, statut au mieux PARTIAL",
+                    probe.hidden.label()
+                ),
+                None => eprintln!("ATTENTION : {}", report::NOTE_HIDDEN_UNKNOWN),
+                _ => {}
+            }
+        }
+    }
+    describe_people(&o);
+
     // Autorisation + verrous des volumes : `prepared` vit jusqu'à la fin de la fonction,
     // donc pendant tout l'effacement ET la vérification.
     let prepared = safety::prepare_disk(disk, &ctx, &code, o.dry_run).map_err(|e| e.to_string())?;
     for l in &prepared.log {
         println!("{l}");
     }
-    describe_plan(&o);
     if o.dry_run {
-        println!("[dry-run] aucune écriture, aucun certificat.");
+        println!("[dry-run] aucune écriture, aucune commande firmware, aucun certificat.");
         return Ok(0);
     }
 
     // Revérifie protection + identité, ouvre le disque, puis le met hors ligne
     // (remis en ligne automatiquement quand `dev` est détruit).
-    let mut dev = rawdisk::RawDisk::open(&prepared)?;
+    let firmware_follows = matches!(decision, Decision::Firmware(_) | Decision::Fallback);
+    let mut dev = rawdisk::RawDisk::open_for(&prepared, firmware_follows)?;
     let mut notes = vec![format!("Cible : disque {} ({})", disk.number, disk.path)];
     notes.extend(prepared.warnings.iter().cloned());
     notes.extend(dev.notes.iter().cloned());
-    let target = Target {
+    for e in &probe.errors {
+        notes.push(format!("Lecture avant effacement : {e}"));
+    }
+    let mut disk_rec = disk.clone();
+    disk_rec.media = media;
+    let mut target = Target {
         notes,
         test_target: false,
-        ssd_overwrite,
+        ssd_overwrite: false,
+        smart: probe.smart.clone(),
+        hidden: probe.hidden.clone(),
+        real_size: probe.real_size,
     };
-    let result = run_erase(&mut dev, disk, o, cfg, paths, target);
+    let result = match decision {
+        Decision::Overwrite { ssd, note } => {
+            target.ssd_overwrite = ssd;
+            if let Some(n) = note {
+                target.notes.insert(0, n);
+            }
+            run_erase(&mut dev, &disk_rec, &o, cfg, paths, target)
+        }
+        Decision::Firmware(m) => run_firmware_erase(
+            &mut dev, &disk_rec, m, &probe, media, &o, cfg, paths, target,
+        ),
+        Decision::Fallback => {
+            let report = FirmwareReport {
+                label: report::NO_FIRMWARE_LABEL.into(),
+                kind: FirmwareKind::Sanitize,
+                command_ok: false,
+                markers: None,
+                fallback: None,
+                critical: Vec::new(),
+            };
+            let notes = target.notes.clone();
+            run_fallback_erase(
+                &mut dev,
+                &disk_rec,
+                report,
+                probe.caps.trim(),
+                &o,
+                cfg,
+                paths,
+                &target,
+                notes,
+                DateTime::now(),
+            )
+        }
+        Decision::Refuse(_) | Decision::Frozen(_) => unreachable!("traités avant la préparation"),
+    };
     // Ordre explicite : poignée fermée et disque remis en ligne, PUIS volumes déverrouillés.
     drop(dev);
     drop(prepared);
@@ -502,6 +971,11 @@ fn erase_file(args: &[String], file: &str, cfg: &Config, paths: &Paths) -> Resul
         return Err(format!("{} n'est pas un fichier ordinaire", path.display()));
     }
     let o = erase_opts(args, cfg, paths)?;
+    if o.method == MethodOpt::Firmware {
+        return Err(
+            "--method firmware : impossible sur un fichier de test (écrasement uniquement)".into(),
+        );
+    }
     let mut dev = erase_hdd::FileDevice::open(path)
         .map_err(|e| format!("ouverture de {} impossible : {e}", path.display()))?;
     if dev.size() == 0 {
@@ -521,7 +995,8 @@ fn erase_file(args: &[String], file: &str, cfg: &Config, paths: &Paths) -> Resul
         volumes: vec![],
     };
     println!("Fichier de test : {}", path.display());
-    describe_plan(&o);
+    describe_plan(&o.plan);
+    describe_people(&o);
     if o.dry_run {
         println!("[dry-run] aucune écriture, aucun certificat.");
         return Ok(0);
@@ -530,8 +1005,11 @@ fn erase_file(args: &[String], file: &str, cfg: &Config, paths: &Paths) -> Resul
         notes: vec![format!("Cible : fichier de test {}", path.display())],
         test_target: true,
         ssd_overwrite: false,
+        smart: None,
+        hidden: Hidden::NotApplicable("fichier de test".into()),
+        real_size: Some(dev.size()),
     };
-    run_erase(&mut dev, &disk, o, cfg, paths, target)
+    run_erase(&mut dev, &disk, &o, cfg, paths, target)
 }
 
 // ---------- Autres commandes ----------
@@ -656,6 +1134,9 @@ fn run(args: &[String]) -> Result<i32, String> {
     if let Some(n) = opt(args, "--erase")? {
         return erase_disk(args, &n, &cfg, &paths);
     }
+    if let Some(n) = opt(args, "--info")? {
+        return info_disk(&n);
+    }
     if has(args, "--list") {
         let ctx = ProtectContext::detect();
         print_disks(&list_disks()?, &ctx);
@@ -734,15 +1215,20 @@ mod tests {
     }
 
     #[test]
-    fn ssd_overwrite_is_refused_unless_forced() {
-        assert_eq!(ssd_policy(MediaType::Hdd, false), Ok(false));
-        assert_eq!(ssd_policy(MediaType::Hdd, true), Ok(false));
+    fn force_overwrite_ssd_is_an_alias_of_method_overwrite_for_ssd() {
         for m in [MediaType::Ssd, MediaType::Nvme, MediaType::Unknown] {
-            let e = ssd_policy(m, false).unwrap_err();
-            assert!(e.contains("ne garantit pas l'effacement d'un SSD"), "{e}");
-            assert!(e.contains("étape 3"));
-            assert_eq!(ssd_policy(m, true), Ok(true));
+            assert_eq!(
+                method_opt(MethodOpt::Auto, true, m),
+                Ok(MethodOpt::Overwrite)
+            );
+            assert_eq!(method_opt(MethodOpt::Auto, false, m), Ok(MethodOpt::Auto));
         }
+        // HDD : sans effet (auto garde Purge d'abord).
+        assert_eq!(
+            method_opt(MethodOpt::Auto, true, MediaType::Hdd),
+            Ok(MethodOpt::Auto)
+        );
+        assert!(method_opt(MethodOpt::Firmware, true, MediaType::Ssd).is_err());
         assert!(USAGE.contains("--force-overwrite-ssd"));
         let o = erase_opts(
             &a(&["--force-overwrite-ssd"]),
@@ -751,6 +1237,42 @@ mod tests {
         )
         .unwrap();
         assert!(o.force_ssd);
+        assert_eq!(o.method, MethodOpt::Auto);
+        assert!(erase_opts(
+            &a(&["--force-overwrite-ssd", "--method", "firmware"]),
+            &Config::default(),
+            &test_paths()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn method_and_fallback_options() {
+        let o = erase_opts(
+            &a(&["--method", "firmware", "--allow-fallback"]),
+            &Config::default(),
+            &test_paths(),
+        )
+        .unwrap();
+        assert_eq!(o.method, MethodOpt::Firmware);
+        assert!(o.allow_fallback);
+        let o = erase_opts(&a(&[]), &Config::default(), &test_paths()).unwrap();
+        assert_eq!(o.method, MethodOpt::Auto);
+        assert!(!o.allow_fallback);
+        assert!(erase_opts(
+            &a(&["--method", "magie"]),
+            &Config::default(),
+            &test_paths()
+        )
+        .is_err());
+        for s in [
+            "--info N",
+            "--method auto|firmware|overwrite",
+            "--allow-fallback",
+            "LECTURE SEULE",
+        ] {
+            assert!(USAGE.contains(s), "{s}");
+        }
     }
 
     fn test_paths() -> Paths {

@@ -14,6 +14,7 @@ pub use crate::config::Customer;
 use crate::config::{Company, Technician};
 use crate::detect::DiskInfo;
 use crate::erase_hdd::{ErrorCounts, Fill, Outcome, Plan, VerifyMode, VerifyResult};
+use crate::hpa::Hidden;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
@@ -129,6 +130,105 @@ pub struct EraseRecord {
     /// Écrasement forcé sur SSD/NVMe (--force-overwrite-ssd) : effacement non garanti.
     #[serde(default)]
     pub ssd_overwrite: bool,
+    /// Taille physique réelle (HPA/DCO compris) quand elle a pu être lue.
+    #[serde(default)]
+    pub real_size_bytes: Option<u64>,
+}
+
+// ---------- Effacement firmware ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareKind {
+    /// Sanitize ATA/NVMe : couvre tout le support, zones cachées comprises.
+    Sanitize,
+    /// ATA Security Erase : zones cachées (HPA/DCO) non garanties.
+    SecurityErase,
+    /// NVMe Format NVM avec effacement sécurisé.
+    Format,
+}
+
+/// Vérification par marqueurs : secteurs échantillons écrits avant la commande firmware.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkerCheck {
+    pub planted: usize,
+    pub erased: usize,
+    /// Marqueurs (même partiellement) encore présents après la commande.
+    pub survivors: usize,
+    /// Marqueurs illisibles après la commande.
+    pub unreadable: usize,
+}
+
+impl MarkerCheck {
+    pub fn ok(&self) -> bool {
+        self.planted > 0
+            && self.survivors == 0
+            && self.unreadable == 0
+            && self.erased == self.planted
+    }
+    pub fn label(&self) -> String {
+        if self.survivors > 0 {
+            format!(
+                "ÉCHEC : {} marqueur(s) subsistant(s) sur {}",
+                self.survivors, self.planted
+            )
+        } else if self.unreadable > 0 || self.erased != self.planted || self.planted == 0 {
+            format!(
+                "Incomplète : {} marqueur(s) illisible(s), {}/{} effacés",
+                self.unreadable, self.erased, self.planted
+            )
+        } else {
+            format!("Marqueurs : {}/{} effacés", self.erased, self.planted)
+        }
+    }
+}
+
+/// Repli Clear après l'échec (ou l'absence) de la commande firmware.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fallback {
+    /// TRIM complet : None = non supporté/non tenté, Some(Err) = refusé.
+    pub trim: Option<Result<(), String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmwareReport {
+    /// Libellé dérivé de la méthode EXÉCUTÉE (ex. « ATA Sanitize Crypto Scramble »).
+    pub label: String,
+    pub kind: FirmwareKind,
+    /// La commande a abouti selon le disque.
+    pub command_ok: bool,
+    /// None : vérification non faite (commande non lancée, marqueurs non posés).
+    pub markers: Option<MarkerCheck>,
+    /// Some : un repli par écrasement a été exécuté (l'Outcome vient alors du moteur).
+    pub fallback: Option<Fallback>,
+    /// Notes critiques placées EN TÊTE (ex. disque resté verrouillé par mot de passe).
+    pub critical: Vec<String>,
+}
+
+/// Statut et niveau NIST d'un effacement firmware SANS repli. Purge UNIQUEMENT si la
+/// commande a réussi ET que tous les marqueurs ont été relus effacés.
+/// `hidden_unknown` : zone cachée HPA/DCO inconnue (non lue, illisible, DCO illisible) ;
+/// comme une zone cachée avérée, elle plafonne à PARTIAL toute méthode autre que Sanitize.
+pub fn firmware_verdict(
+    fw: &FirmwareReport,
+    hidden_sectors: u64,
+    hidden_unknown: bool,
+) -> (Status, &'static str) {
+    let markers_ok = fw.markers.as_ref().is_some_and(MarkerCheck::ok);
+    if !fw.command_ok || !markers_ok {
+        return (Status::Failed, "Aucun");
+    }
+    if (hidden_sectors > 0 || hidden_unknown) && fw.kind != FirmwareKind::Sanitize {
+        return (Status::Partial, MethodKind::Firmware.level());
+    }
+    (Status::Erased, MethodKind::Firmware.level())
+}
+
+fn cap_partial(s: Status) -> Status {
+    if s == Status::Erased {
+        Status::Partial
+    } else {
+        s
+    }
 }
 
 /// Statut d'après les résultats réels. `degraded` = repli plus faible que la méthode prévue.
@@ -184,6 +284,16 @@ pub const NOTE_SSD: &str = "Écrasement sur SSD/NVMe : non garanti (sur-provisio
 pub const NOTE_UNVERIFIED: &str =
     "NON VÉRIFIÉ : aucune relecture n'a confirmé l'effacement (statut limité à PARTIAL)";
 
+/// Zone cachée inconnue, méthode autre que Sanitize.
+pub const NOTE_HIDDEN_UNKNOWN: &str =
+    "Zone cachée HPA/DCO non vérifiable : effacement complet non garanti (statut au mieux PARTIAL)";
+
+/// Toujours ajoutée quand Sanitize est utilisée.
+pub const NOTE_SANITIZE_HYPOTHESIS: &str = "Hypothèse : Sanitize couvre tout le support, y compris HPA/DCO (norme ACS) ; les marqueurs ne testent que la zone visible";
+
+/// Libellé du « rapport firmware » quand aucune commande n'était utilisable (repli direct).
+pub const NO_FIRMWARE_LABEL: &str = "aucune commande firmware utilisable";
+
 /// Préfixe d'ID dérivé de APP_NAME : capitales (DiskErase → DE), sinon 3 premières lettres.
 pub fn id_prefix() -> String {
     let caps: String = APP_NAME
@@ -236,13 +346,40 @@ pub struct RecordInput<'a> {
     pub test_target: bool,
     /// Écrasement forcé sur SSD/NVMe : statut au mieux PARTIAL.
     pub ssd_overwrite: bool,
+    /// Zones cachées HPA/DCO (détection seule).
+    pub hidden: Hidden,
+    /// Taille physique réelle connue (HPA/DCO, namespace NVMe, fichier).
+    pub real_size: Option<u64>,
+    /// Some : effacement firmware (avec ou sans repli).
+    pub firmware: Option<FirmwareReport>,
+}
+
+/// Libellé du repli, dérivé de ce qui a été exécuté.
+pub fn fallback_label(plan: &Plan, fb: &Fallback) -> String {
+    let trim = match fb.trim {
+        Some(Ok(())) => "TRIM complet + ",
+        _ => "",
+    };
+    format!("Repli Clear : {trim}{}", method_label(plan))
 }
 
 pub fn build_record(i: RecordInput) -> EraseRecord {
     let o = i.outcome;
     let size = o.size.max(1);
+    let hidden_unknown = i.hidden.unknown();
+    let hidden = i.hidden.hidden_sectors().unwrap_or(0);
+    let fw_only = i.firmware.as_ref().filter(|f| f.fallback.is_none());
+    let fallback = i
+        .firmware
+        .as_ref()
+        .and_then(|f| f.fallback.as_ref().map(|fb| (f, fb)));
+
     // Notes critiques EN TÊTE, puis les notes de l'appelant.
-    let mut notes = Vec::new();
+    let mut notes: Vec<String> = i
+        .firmware
+        .as_ref()
+        .map(|f| f.critical.clone())
+        .unwrap_or_default();
     if o.size != i.disk.size_bytes {
         notes.push(format!(
             "ÉCHEC : taille effacée ({} octets) différente de la taille confirmée du disque ({} octets)",
@@ -252,10 +389,113 @@ pub fn build_record(i: RecordInput) -> EraseRecord {
     if i.ssd_overwrite {
         notes.push(NOTE_SSD.to_string());
     }
-    if o.verify == VerifyResult::NotRequested {
+    if let Some((fw, _)) = fallback {
+        notes.push(if fw.label == NO_FIRMWARE_LABEL {
+            "Aucune commande d'effacement firmware utilisable : repli sur TRIM + écrasement (NIST Clear), statut au mieux PARTIAL".to_string()
+        } else {
+            format!(
+                "REPLI après « {} » : effacement par écrasement (NIST Clear), statut au mieux PARTIAL",
+                fw.label
+            )
+        });
+    }
+    let sanitize_used = fw_only.is_some_and(|f| f.kind == FirmwareKind::Sanitize && f.command_ok);
+    let sanitize_planned = fw_only.is_some_and(|f| f.kind == FirmwareKind::Sanitize);
+    if hidden_unknown && !sanitize_planned {
+        notes.push(NOTE_HIDDEN_UNKNOWN.to_string());
+    }
+    if sanitize_used {
+        notes.push(NOTE_SANITIZE_HYPOTHESIS.to_string());
+    }
+    if fw_only.is_none() && o.verify == VerifyResult::NotRequested {
         notes.push(NOTE_UNVERIFIED.to_string());
     }
+    if hidden > 0 {
+        match fw_only {
+            Some(fw) if fw.kind == FirmwareKind::Sanitize && fw.command_ok => notes.push(format!(
+                "{} — Sanitize couvre tout le support, zones cachées comprises",
+                i.hidden.label()
+            )),
+            Some(fw) => notes.push(format!(
+                "ZONE CACHÉE NON GARANTIE : {} — {} ne couvre pas forcément cette zone (statut au mieux PARTIAL)",
+                i.hidden.label(),
+                fw.label
+            )),
+            None => notes.push(format!(
+                "ZONE CACHÉE NON EFFACÉE : {} — l'écrasement n'atteint pas cette zone (statut au mieux PARTIAL)",
+                i.hidden.label()
+            )),
+        }
+    }
+    if let Some(fw) = fw_only {
+        if !fw.command_ok {
+            notes.push(format!(
+                "ÉCHEC : {} non aboutie, aucun repli effectué",
+                fw.label
+            ));
+        }
+    }
     notes.extend(i.notes);
+
+    let verify_text = match o.verify {
+        VerifyResult::NotRequested => "Non demandée",
+        VerifyResult::Passed => "OK",
+        VerifyResult::Failed => "ÉCHEC",
+        VerifyResult::Incomplete => "Incomplète",
+    };
+    let (method, level, passes, final_pass, verify, verify_result, rounds_done, status) =
+        match fw_only {
+            Some(fw) => {
+                let (status, level) = if o.aborted {
+                    (Status::Aborted, "Aucun")
+                } else {
+                    firmware_verdict(fw, hidden, hidden_unknown)
+                };
+                (
+                    fw.label.clone(),
+                    level.to_string(),
+                    vec!["firmware".to_string()],
+                    "Firmware".to_string(),
+                    "Marqueurs".to_string(),
+                    fw.markers
+                        .as_ref()
+                        .map(MarkerCheck::label)
+                        .unwrap_or_else(|| "Non faite".into()),
+                    u32::from(fw.command_ok),
+                    status,
+                )
+            }
+            None => {
+                // SSD/NVMe écrasé ou repli : méthode dégradée -> au mieux PARTIAL.
+                let mut status = compute_status(
+                    o,
+                    i.plan.passes.len(),
+                    i.degraded || i.ssd_overwrite || fallback.is_some(),
+                    i.disk.size_bytes,
+                );
+                if hidden > 0 || hidden_unknown {
+                    status = cap_partial(status);
+                }
+                (
+                    match fallback {
+                        Some((_, fb)) => fallback_label(i.plan, fb),
+                        None => method_label(i.plan),
+                    },
+                    i.kind.level().to_string(),
+                    i.plan.passes.iter().map(|p| p.label()).collect(),
+                    i.plan
+                        .passes
+                        .last()
+                        .map(|p| p.final_label())
+                        .unwrap_or("—")
+                        .to_string(),
+                    i.plan.verify.label().to_string(),
+                    verify_text.to_string(),
+                    u32::from(o.passes_completed == i.plan.passes.len()),
+                    status,
+                )
+            }
+        };
     EraseRecord {
         id: make_id(&i.disk.serial, &i.start, &i.end, i.plan.seed),
         app: APP_NAME.to_string(),
@@ -268,25 +508,13 @@ pub fn build_record(i: RecordInput) -> EraseRecord {
             media: i.disk.media.to_string(),
             size_bytes: o.size,
         },
-        method: method_label(i.plan),
-        level: i.kind.level().to_string(),
-        passes: i.plan.passes.iter().map(|p| p.label()).collect(),
-        final_pass: i
-            .plan
-            .passes
-            .last()
-            .map(|p| p.final_label())
-            .unwrap_or("—")
-            .to_string(),
-        verify: i.plan.verify.label().to_string(),
-        verify_result: match o.verify {
-            VerifyResult::NotRequested => "Non demandée",
-            VerifyResult::Passed => "OK",
-            VerifyResult::Failed => "ÉCHEC",
-            VerifyResult::Incomplete => "Incomplète",
-        }
-        .to_string(),
-        rounds_done: u32::from(o.passes_completed == i.plan.passes.len()),
+        method,
+        level,
+        passes,
+        final_pass,
+        verify,
+        verify_result,
+        rounds_done,
         rounds_requested: 1,
         start: i.start.slash(),
         end: i.end.slash(),
@@ -300,14 +528,8 @@ pub fn build_record(i: RecordInput) -> EraseRecord {
         avg_mb_s: o.avg_mb_s,
         min_mb_s: o.min_mb_s,
         max_mb_s: o.max_mb_s,
-        // SSD/NVMe écrasé : traité comme une méthode dégradée -> au mieux PARTIAL.
-        status: compute_status(
-            o,
-            i.plan.passes.len(),
-            i.degraded || i.ssd_overwrite,
-            i.disk.size_bytes,
-        ),
-        hpa_dco: "Non vérifié".to_string(), // lecture ATA IDENTIFY : étape 3
+        status,
+        hpa_dco: i.hidden.label(),
         org: i.org,
         technician: i.technician,
         customer: i.customer,
@@ -317,6 +539,7 @@ pub fn build_record(i: RecordInput) -> EraseRecord {
         smart: i.smart,
         test_target: i.test_target,
         ssd_overwrite: i.ssd_overwrite,
+        real_size_bytes: i.real_size.or_else(|| i.hidden.real_size_bytes()),
     }
 }
 
@@ -530,6 +753,9 @@ pub(crate) mod tests {
             smart: None,
             test_target: false,
             ssd_overwrite: false,
+            hidden: Hidden::NotApplicable("test".into()),
+            real_size: None,
+            firmware: None,
         })
     }
 
@@ -616,6 +842,9 @@ pub(crate) mod tests {
             smart: None,
             test_target: false,
             ssd_overwrite: false,
+            hidden: Hidden::NotApplicable("test".into()),
+            real_size: None,
+            firmware: None,
         });
         assert_eq!(r.status, Status::Failed);
         assert!(
@@ -662,6 +891,9 @@ pub(crate) mod tests {
             smart: None,
             test_target: false,
             ssd_overwrite: false,
+            hidden: Hidden::NotApplicable("test".into()),
+            real_size: None,
+            firmware: None,
         });
         assert_eq!(r.status, Status::Partial);
         assert!(r.notes.iter().any(|n| n == NOTE_UNVERIFIED));
@@ -719,7 +951,335 @@ pub(crate) mod tests {
             smart: None,
             test_target: false,
             ssd_overwrite: ssd,
+            hidden: Hidden::NotApplicable("test".into()),
+            real_size: None,
+            firmware: None,
         })
+    }
+
+    fn input_with<'a>(
+        disk: &'a DiskInfo,
+        plan: &'a Plan,
+        o: &'a Outcome,
+        hidden: Hidden,
+        firmware: Option<FirmwareReport>,
+    ) -> RecordInput<'a> {
+        RecordInput {
+            disk,
+            plan,
+            outcome: o,
+            kind: MethodKind::Overwrite,
+            degraded: false,
+            org: Company::default(),
+            technician: Technician::default(),
+            customer: Customer::default(),
+            tag: String::new(),
+            start: DateTime {
+                year: 2026,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+            },
+            end: DateTime {
+                year: 2026,
+                month: 1,
+                day: 1,
+                hour: 1,
+                minute: 0,
+                second: 0,
+            },
+            notes: vec!["note appelant".into()],
+            smart: None,
+            test_target: false,
+            ssd_overwrite: false,
+            hidden,
+            real_size: None,
+            firmware,
+        }
+    }
+
+    fn hpa(n: u64) -> Hidden {
+        crate::hpa::compare(
+            SZ / 512 - n,
+            512,
+            Ok(SZ / 512 - 1),
+            crate::hpa::DcoReading::Unsupported,
+        )
+    }
+
+    fn fw(kind: FirmwareKind, ok: bool, markers: Option<MarkerCheck>) -> FirmwareReport {
+        FirmwareReport {
+            label: "ATA Sanitize Crypto Scramble".into(),
+            kind,
+            command_ok: ok,
+            markers,
+            fallback: None,
+            critical: vec![],
+        }
+    }
+
+    fn good_markers() -> MarkerCheck {
+        MarkerCheck {
+            planted: 1002,
+            erased: 1002,
+            survivors: 0,
+            unreadable: 0,
+        }
+    }
+
+    /// Outcome synthétique d'un effacement firmware (pas de passe logicielle).
+    fn fw_outcome() -> Outcome {
+        Outcome {
+            passes_completed: 0,
+            speed_samples: vec![],
+            ..good_outcome()
+        }
+    }
+
+    #[test]
+    fn firmware_success_with_markers_is_purge_and_label_is_derived() {
+        let d = sample_disk();
+        let o = fw_outcome();
+        let plan = Plan::dod_default(1);
+        let r = build_record(input_with(
+            &d,
+            &plan,
+            &o,
+            Hidden::NotApplicable("NVMe".into()),
+            Some(fw(FirmwareKind::Sanitize, true, Some(good_markers()))),
+        ));
+        assert_eq!(r.status, Status::Erased);
+        assert_eq!(r.level, "Purge");
+        assert_eq!(r.method, "ATA Sanitize Crypto Scramble");
+        assert_eq!(r.passes, vec!["firmware"]);
+        assert_eq!(r.verify_result, "Marqueurs : 1002/1002 effacés");
+        assert_eq!(r.hpa_dco, "Non applicable (NVMe)");
+        assert!(!r.notes.iter().any(|n| n == NOTE_UNVERIFIED));
+    }
+
+    #[test]
+    fn unknown_hidden_area_caps_everything_but_sanitize() {
+        let d = sample_disk();
+        let plan = Plan::dod_default(1);
+        let unknowns = [
+            Hidden::NotChecked,
+            Hidden::Unreadable("READ NATIVE MAX : erreur Windows 1".into()),
+            crate::hpa::compare(
+                SZ / 512,
+                512,
+                Ok(SZ / 512 - 1),
+                crate::hpa::DcoReading::Error("ABRT".into()),
+            ),
+        ];
+        for h in unknowns {
+            // Écrasement : PARTIAL + note.
+            let r = build_record(input_with(&d, &plan, &good_outcome(), h.clone(), None));
+            assert_eq!(r.status, Status::Partial, "{h:?}");
+            assert_eq!(r.notes[0], NOTE_HIDDEN_UNKNOWN, "{:?}", r.notes);
+            // Security Erase : PARTIAL + note.
+            let o = fw_outcome();
+            let r = build_record(input_with(
+                &d,
+                &plan,
+                &o,
+                h.clone(),
+                Some(fw(FirmwareKind::SecurityErase, true, Some(good_markers()))),
+            ));
+            assert_eq!((r.status, r.level.as_str()), (Status::Partial, "Purge"));
+            assert_eq!(r.notes[0], NOTE_HIDDEN_UNKNOWN);
+            // Sanitize : non plafonné, note d'hypothèse.
+            let r = build_record(input_with(
+                &d,
+                &plan,
+                &o,
+                h.clone(),
+                Some(fw(FirmwareKind::Sanitize, true, Some(good_markers()))),
+            ));
+            assert_eq!(r.status, Status::Erased);
+            assert!(r.notes.iter().any(|n| n == NOTE_SANITIZE_HYPOTHESIS));
+            assert!(!r.notes.iter().any(|n| n == NOTE_HIDDEN_UNKNOWN));
+        }
+        assert_eq!(
+            firmware_verdict(
+                &fw(FirmwareKind::Format, true, Some(good_markers())),
+                0,
+                true
+            ),
+            (Status::Partial, "Purge")
+        );
+    }
+
+    #[test]
+    fn no_firmware_fallback_note_is_plain_french() {
+        let d = sample_disk();
+        let mut plan = Plan::dod_default(1);
+        plan.passes = vec![Fill::Random];
+        let o = Outcome {
+            passes_completed: 1,
+            ..good_outcome()
+        };
+        let mut f = fw(FirmwareKind::Sanitize, false, None);
+        f.label = NO_FIRMWARE_LABEL.into();
+        f.fallback = Some(Fallback { trim: None });
+        let r = build_record(input_with(
+            &d,
+            &plan,
+            &o,
+            Hidden::NotApplicable("NVMe".into()),
+            Some(f),
+        ));
+        assert!(r.notes[0].starts_with(
+            "Aucune commande d'effacement firmware utilisable : repli sur TRIM + écrasement"
+        ));
+        assert_eq!(r.status, Status::Partial);
+    }
+
+    #[test]
+    fn firmware_without_markers_or_with_survivor_is_never_purge() {
+        let d = sample_disk();
+        let o = fw_outcome();
+        let plan = Plan::dod_default(1);
+        let cases = [
+            fw(FirmwareKind::Sanitize, true, None),
+            fw(
+                FirmwareKind::Sanitize,
+                true,
+                Some(MarkerCheck {
+                    survivors: 1,
+                    erased: 1001,
+                    ..good_markers()
+                }),
+            ),
+            fw(
+                FirmwareKind::Sanitize,
+                true,
+                Some(MarkerCheck {
+                    unreadable: 3,
+                    erased: 999,
+                    ..good_markers()
+                }),
+            ),
+            fw(FirmwareKind::Sanitize, false, Some(good_markers())),
+        ];
+        for f in cases {
+            let r = build_record(input_with(
+                &d,
+                &plan,
+                &o,
+                Hidden::NotChecked,
+                Some(f.clone()),
+            ));
+            assert_eq!(r.status, Status::Failed, "{f:?}");
+            assert_ne!(r.level, "Purge", "{f:?}");
+        }
+        let r = build_record(input_with(
+            &d,
+            &plan,
+            &o,
+            Hidden::NotChecked,
+            Some(fw(FirmwareKind::Sanitize, false, None)),
+        ));
+        assert!(r.notes[0].contains("aucun repli"), "{:?}", r.notes);
+        assert_eq!(r.notes.last().unwrap(), "note appelant");
+    }
+
+    #[test]
+    fn hidden_sectors_cap_overwrite_and_security_erase_but_not_sanitize() {
+        let d = sample_disk();
+        let plan = Plan::dod_default(1);
+        // Écrasement DoD + HPA : PARTIAL, note en tête.
+        let o = good_outcome();
+        let r = build_record(input_with(&d, &plan, &o, hpa(1000), None));
+        assert_eq!(r.status, Status::Partial);
+        assert_eq!(r.hpa_dco, "HPA : 1000 secteurs cachés");
+        assert!(
+            r.notes[0].starts_with("ZONE CACHÉE NON EFFACÉE"),
+            "{:?}",
+            r.notes
+        );
+        assert_eq!(r.real_size_bytes, Some(SZ));
+        // Security Erase + HPA : PARTIAL (Purge mais zone non garantie).
+        let o = fw_outcome();
+        let r = build_record(input_with(
+            &d,
+            &plan,
+            &o,
+            hpa(1000),
+            Some(fw(FirmwareKind::SecurityErase, true, Some(good_markers()))),
+        ));
+        assert_eq!(r.status, Status::Partial);
+        assert!(r.notes[0].starts_with("ZONE CACHÉE NON GARANTIE"));
+        // Sanitize réussi + HPA : ERASED, la note dit que Sanitize couvre tout.
+        let r = build_record(input_with(
+            &d,
+            &plan,
+            &o,
+            hpa(1000),
+            Some(fw(FirmwareKind::Sanitize, true, Some(good_markers()))),
+        ));
+        assert_eq!(r.status, Status::Erased);
+        assert!(r.notes[0].contains("Sanitize couvre tout le support"));
+        // Sans zone cachée : aucune note HPA.
+        let r = build_record(input_with(&d, &plan, &good_outcome(), hpa(0), None));
+        assert_eq!(r.status, Status::Erased);
+        assert_eq!(r.hpa_dco, "Aucun secteur caché");
+    }
+
+    #[test]
+    fn fallback_is_clear_at_best_partial_with_derived_label() {
+        let d = sample_disk();
+        let mut plan = Plan::dod_default(1);
+        plan.passes = vec![Fill::Random];
+        let o = Outcome {
+            passes_completed: 1,
+            ..good_outcome()
+        };
+        let mut f = fw(FirmwareKind::Sanitize, false, None);
+        f.fallback = Some(Fallback { trim: Some(Ok(())) });
+        let r = build_record(input_with(
+            &d,
+            &plan,
+            &o,
+            Hidden::NotChecked,
+            Some(f.clone()),
+        ));
+        assert_eq!(r.status, Status::Partial);
+        assert_eq!(r.level, "Clear");
+        assert_eq!(
+            r.method,
+            "Repli Clear : TRIM complet + Écrasement 1 passe(s) (motifs random)"
+        );
+        assert!(r.notes[0].starts_with("REPLI après « ATA Sanitize Crypto Scramble »"));
+        f.fallback = Some(Fallback {
+            trim: Some(Err("refusé".into())),
+        });
+        let r = build_record(input_with(&d, &plan, &o, Hidden::NotChecked, Some(f)));
+        assert_eq!(
+            r.method,
+            "Repli Clear : Écrasement 1 passe(s) (motifs random)"
+        );
+    }
+
+    #[test]
+    fn marker_labels() {
+        assert_eq!(good_markers().label(), "Marqueurs : 1002/1002 effacés");
+        assert!(good_markers().ok());
+        let m = MarkerCheck {
+            survivors: 2,
+            ..good_markers()
+        };
+        assert!(!m.ok() && m.label().starts_with("ÉCHEC"));
+        assert!(!MarkerCheck::default().ok());
+    }
+
+    #[test]
+    fn old_history_without_real_size_still_loads() {
+        let mut v = serde_json::to_value(sample_record()).unwrap();
+        v.as_object_mut().unwrap().remove("real_size_bytes");
+        let r: EraseRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(r.real_size_bytes, None);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Détection des disques physiques (\\.\PhysicalDriveN).
 //!
 //! Lecture seule : on ouvre chaque disque avec un accès 0 (requêtes de propriétés uniquement),
-//! jamais en écriture. SMART et HPA/DCO viennent plus tard (IOCTL_ATA_PASS_THROUGH).
+//! jamais en écriture. SMART, HPA/DCO et capacités firmware : voir ata.rs / nvme.rs.
 
 use std::fmt;
 
@@ -186,6 +186,23 @@ fn query_property(h: &Handle, property_id: u32, out: &mut [u8]) -> bool {
     let mut q = [0u8; 12];
     q[0..4].copy_from_slice(&property_id.to_le_bytes());
     winio::ioctl(h, winio::IOCTL_STORAGE_QUERY_PROPERTY, &q, out).is_ok()
+}
+
+/// DEVICE_TRIM_DESCRIPTOR (Version, Size, TrimEnabled à l'octet 8) → TRIM activé ?
+pub fn parse_trim_descriptor(buf: &[u8]) -> Option<bool> {
+    (buf.len() >= 9 && winio::u32_at(buf, 4) >= 9).then(|| buf[8] != 0)
+}
+
+/// StorageDeviceTrimProperty (8), en lecture seule. None si la propriété n'est pas lisible.
+pub fn trim_enabled(number: u32) -> Option<bool> {
+    let path = format!(r"\\.\PhysicalDrive{number}");
+    let h = Handle::open(&path, winio::GENERIC_READ)
+        .or_else(|_| Handle::open(&path, 0))
+        .ok()?;
+    let mut buf = [0u8; 16];
+    query_property(&h, 8, &mut buf)
+        .then_some(())
+        .and_then(|_| parse_trim_descriptor(&buf))
 }
 
 /// Relit un seul disque (descripteur + taille) juste avant de l'ouvrir en écriture,
@@ -436,6 +453,18 @@ mod tests {
         b[80..91].copy_from_slice(b"0025_D120.\0");
         let d = parse_device_descriptor(&b).unwrap();
         assert_eq!(d.serial, "0025_D120");
+    }
+
+    #[test]
+    fn parses_trim_descriptor() {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&12u32.to_le_bytes());
+        b[4..8].copy_from_slice(&12u32.to_le_bytes());
+        b[8] = 1;
+        assert_eq!(parse_trim_descriptor(&b), Some(true));
+        b[8] = 0;
+        assert_eq!(parse_trim_descriptor(&b), Some(false));
+        assert_eq!(parse_trim_descriptor(&[0u8; 16]), None);
     }
 
     #[test]

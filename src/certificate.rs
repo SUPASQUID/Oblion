@@ -366,10 +366,9 @@ fn page1(rec: &EraseRecord, logo: Option<(u32, u32)>, generated: &str) -> Page {
     let d = &rec.disk;
     let mut yl = section(&mut p, M, y, CW, "Disque");
     let mut yr = yl;
-    let real = if rec.hpa_dco.starts_with("Non") {
-        "Non vérifiée (HPA/DCO non lu)".to_string()
-    } else {
-        size_text(d.size_bytes)
+    let real = match rec.real_size_bytes {
+        Some(n) => size_text(n),
+        None => "Non vérifiée (HPA/DCO non lu)".to_string(),
     };
     for (l, v) in [
         ("Modèle", d.model.clone()),
@@ -426,7 +425,14 @@ fn page1(rec: &EraseRecord, logo: Option<(u32, u32)>, generated: &str) -> Page {
             format!("{} ({})", rec.status.code(), rec.status.fr()),
         ),
         ("Méthode", rec.method.clone()),
-        ("Algorithme PRNG", "SplitMix64".to_string()),
+        (
+            "Algorithme PRNG",
+            if rec.passes.iter().any(|p| p == "firmware") {
+                "— (commande firmware)".to_string()
+            } else {
+                "SplitMix64".to_string()
+            },
+        ),
         ("Passes", rec.passes.join(", ")),
         ("Passe finale", rec.final_pass.clone()),
         ("Vérification", verif),
@@ -613,7 +619,7 @@ fn page2(rec: &EraseRecord, generated: &str) -> Page {
                 y + 24.0,
                 10.0,
                 Font::Sans,
-                "Données SMART non disponibles (lecture ATA prévue à une étape ultérieure)",
+                "Données SMART non disponibles (non lues avant l'effacement ou non supportées)",
             );
             y += 40.0;
         }
@@ -827,6 +833,24 @@ mod tests {
         let b = render(&r, None);
         assert!(contains(&b, "Reallocated_Sector_Ct"));
         assert!(!contains(&b, "SMART non disponibles"));
+    }
+
+    #[test]
+    fn real_size_and_firmware_fields_are_printed() {
+        let mut r = sample_record();
+        assert!(contains(&render(&r, None), "\\(HPA/DCO non lu\\)"));
+        r.real_size_bytes = Some(320_072_933_376 + 512_000);
+        r.hpa_dco = "HPA : 1000 secteurs cachés".into();
+        r.method = "ATA Sanitize Crypto Scramble".into();
+        r.level = "Purge".into();
+        r.passes = vec!["firmware".into()];
+        r.verify_result = "Marqueurs : 1002/1002 effacés".into();
+        let b = render(&r, None);
+        assert!(contains(&b, "320,07 Go \\(320 073 445 376 octets\\)"));
+        assert!(contains(&b, "NIST 800-88 : Purge"));
+        assert!(contains(&b, "Marqueurs : 1002/1002"));
+        assert!(contains(&b, "commande firmware"));
+        assert!(!contains(&b, "SplitMix64"));
     }
 
     #[test]

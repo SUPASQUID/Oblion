@@ -20,14 +20,23 @@ Projet étudiant (BTS SIO). Nom provisoire.
 |---|---|---|
 | 1 | Détection des disques + sécurités (disque système et clé protégés, confirmation par n° de série, `--dry-run`) | fait, testé en lecture seule |
 | 2 | Effacement HDD par écrasement (DoD 5220.22-M, vérification, reprise sur erreur) + certificat PDF + historique JSON/CSV | fait, testé sur fichier et sur disque virtuel VHD (verrouillage des volumes avec/sans lettre, mise hors ligne, écriture brute, vérification, remise en ligne) |
-| 3 | SSD SATA/NVMe (Sanitize, Secure Erase), SMART, HPA/DCO | à faire |
+| 3 | SSD SATA/NVMe (Sanitize, Secure Erase), SMART, HPA/DCO, `--info` | fait ; lecture NVMe (Identify, SMART) testée sur matériel réel ; commandes firmware destructives et chemin ATA/SATA **non testés sur matériel** |
 | 4 | Interface graphique (sans GPU) | à faire |
 | 5 | Zip portable, CI GitHub Actions, releases signées SHA256 | à faire |
 
 ### Niveaux NIST 800-88
 
 - Un **écrasement** (DoD, 1 passe…) vaut **Clear**, jamais Purge.
-- **Purge** n'est indiqué que si une commande firmware (Sanitize / Secure Erase) a réellement réussi (étape 3).
+- **Purge** n'est indiqué que si une commande firmware (Sanitize / Secure Erase) a réellement réussi
+  **et** si la vérification par marqueurs le confirme : avant la commande, un motif aléatoire unique est
+  écrit sur ~1000 secteurs répartis sur le disque ; après, aucun ne doit subsister.
+- Limites assumées : la vérification par marqueurs est un **échantillonnage** (elle ne prouve pas
+  que chaque secteur est effacé) ; on suppose, comme la norme ACS, que Sanitize couvre aussi les zones
+  cachées HPA/DCO, que les marqueurs ne peuvent pas tester.
+- Les commandes firmware ne passent généralement **pas** par un adaptateur USB ni par certains
+  pilotes RAID / Intel RST : branchez le disque en SATA ou NVMe direct. Tout refus est indiqué sur le certificat.
+- Security Erase (ATA) impose de poser un mot de passe temporaire (`DiskErase`) ; il est retiré
+  automatiquement, et indiqué sur le certificat si le retrait échoue.
 - Le statut du certificat est **calculé** à partir des résultats ; il ne peut pas être saisi à la main.
 
 ### Utilisation (console, en administrateur)
