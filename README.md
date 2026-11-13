@@ -1,63 +1,93 @@
-# DiskErase
+<p align="center"><img src="assets/oblion-logo.svg" width="96" alt="Oblion"></p>
 
-> ⚠️ **Outil DESTRUCTIF — version de développement (pré-alpha).**
-> L'effacement a été validé sur un **disque virtuel (VHD)**, mais **pas encore sur du matériel réel**.
-> N'utilisez pas cet outil sur un disque contenant des données à conserver.
-> Utilisation à vos risques, sans aucune garantie (voir [LICENSE](LICENSE)).
+# Oblion
+
+> ⚠️ **Outil destructif** : il efface définitivement les disques. Fourni tel quel, sans aucune
+> garantie ; l'auteur décline toute responsabilité en cas de perte de données (voir [LICENSE](LICENSE)).
+> État des tests : effacement validé sur disque virtuel (VHD) ; pas encore validé sur du matériel physique.
 >
-> ⚠️ **DESTRUCTIVE tool — development version (pre-alpha).** Physical-disk erasure has **not yet
-> been validated on real hardware** yet (validated on a virtual VHD disk only). Use at your own risk, without any warranty.
+> ⚠️ **Destructive tool** — it permanently wipes disks. Provided as is, without any warranty; the author
+> accepts no liability for data loss. Validated on a virtual (VHD) disk, not yet on physical hardware.
+
+![Liste des disques](docs/screenshots/01-liste.png)
 
 ## Français
 
 Outil Windows portable (sans installation, compatible WinPE / Medicat) pour effacer des disques
-durs et SSD, puis générer un certificat PDF d'effacement inspiré du rapport nwipe.
-Projet étudiant (BTS SIO). Nom provisoire.
+durs, SSD SATA et NVMe, puis générer un certificat PDF d'effacement inspiré du rapport nwipe.
+Projet étudiant (BTS SIO). Anciennement « DiskErase ».
 
-### Avancement
+### Deux exécutables
 
-| Étape | Contenu | État |
-|---|---|---|
-| 1 | Détection des disques + sécurités (disque système et clé protégés, confirmation par n° de série, `--dry-run`) | fait, testé en lecture seule |
-| 2 | Effacement HDD par écrasement (DoD 5220.22-M, vérification, reprise sur erreur) + certificat PDF + historique JSON/CSV | fait, testé sur fichier et sur disque virtuel VHD (verrouillage des volumes avec/sans lettre, mise hors ligne, écriture brute, vérification, remise en ligne) |
-| 3 | SSD SATA/NVMe (Sanitize, Secure Erase), SMART, HPA/DCO, `--info` | fait ; lecture NVMe (Identify, SMART) testée sur matériel réel ; commandes firmware destructives et chemin ATA/SATA **non testés sur matériel** |
-| 4 | Interface graphique (sans GPU) | à faire |
-| 5 | Zip portable, CI GitHub Actions, releases signées SHA256 | à faire |
+| Fichier | Rôle |
+|---|---|
+| `oblion.exe` | Interface graphique (rendu logiciel, **aucun GPU requis** : fonctionne sous WinPE) |
+| `oblion-cli.exe` | Mode console : scripts, codes de retour, WinPE minimal (aucune DLL graphique) |
+
+Les deux appellent exactement le même code d'effacement et les mêmes sécurités.
+
+### Ce que fait l'outil
+
+- Détection des disques, **disque système et clé de démarrage protégés** (refus si la protection
+  ne peut pas être établie), confirmation par le n° de série, `--dry-run`.
+- **HDD** : Sanitize ou Security Erase (Purge) si le disque le supporte, sinon écrasement
+  DoD 5220.22-M (0x00, 0xFF, aléatoire) avec vérification et reprise sur erreur (Clear).
+- **SSD SATA** : ATA Sanitize (Crypto Scramble / Block Erase), sinon Security Erase.
+- **NVMe** : Sanitize (Crypto / Block Erase), sinon Format NVM sécurisé.
+- Disque « gelé » (frozen) détecté : rien n'est tenté, l'opérateur est guidé.
+- SMART (ATA et NVMe), détection HPA/DCO (sans modification).
+- Certificat PDF 2 pages (QR, code-barres, ID unique, SMART, profil de débit), historique JSON, export CSV,
+  carnet de clients.
 
 ### Niveaux NIST 800-88
 
-- Un **écrasement** (DoD, 1 passe…) vaut **Clear**, jamais Purge.
-- **Purge** n'est indiqué que si une commande firmware (Sanitize / Secure Erase) a réellement réussi
-  **et** si la vérification par marqueurs le confirme : avant la commande, un motif aléatoire unique est
-  écrit sur ~1000 secteurs répartis sur le disque ; après, aucun ne doit subsister.
-- Limites assumées : la vérification par marqueurs est un **échantillonnage** (elle ne prouve pas
-  que chaque secteur est effacé) ; on suppose, comme la norme ACS, que Sanitize couvre aussi les zones
-  cachées HPA/DCO, que les marqueurs ne peuvent pas tester.
-- Les commandes firmware ne passent généralement **pas** par un adaptateur USB ni par certains
-  pilotes RAID / Intel RST : branchez le disque en SATA ou NVMe direct. Tout refus est indiqué sur le certificat.
-- Security Erase (ATA) impose de poser un mot de passe temporaire (`DiskErase`) ; il est retiré
-  automatiquement, et indiqué sur le certificat si le retrait échoue.
+- Un **écrasement** vaut **Clear**, jamais Purge.
+- **Purge** n'est indiqué que si la commande firmware a réussi **et** que la vérification par
+  marqueurs le confirme (motif aléatoire écrit sur ~1000 secteurs avant, aucun ne doit subsister après).
+- La vérification par marqueurs est un échantillonnage ; on suppose, comme la norme ACS, que
+  Sanitize couvre aussi les zones cachées HPA/DCO.
 - Le statut du certificat est **calculé** à partir des résultats ; il ne peut pas être saisi à la main.
 
-### Utilisation (console, en administrateur)
+### Conseils
+
+- Branchez le disque **en direct** (SATA ou NVMe sur la carte mère) : la plupart des adaptateurs USB
+  et certains pilotes RAID / Intel RST bloquent les commandes d'effacement firmware. Tout refus est
+  indiqué sur le certificat.
+- Lancez en **administrateur**.
+- L'exécutable n'est pas signé : SmartScreen / le Contrôle intelligent des applications peuvent le
+  bloquer (désactivation temporaire, ou lancement depuis Medicat / WinPE).
+- Security Erase (ATA) impose un mot de passe temporaire (`DiskErase`), retiré automatiquement ;
+  il est indiqué sur le certificat si le retrait échoue.
+
+### Utilisation en console
 
 ```
-DiskErase --list
-DiskErase --erase N --confirm XXXX --dry-run
-DiskErase --erase-file test.img --client exemple --tag INV-001
-DiskErase --history
-DiskErase --export-csv historique.csv
+oblion-cli --list
+oblion-cli --info N
+oblion-cli --erase N --confirm XXXX --dry-run
+oblion-cli --erase N --confirm XXXX --client exemple --tag INV-001
+oblion-cli --history
+oblion-cli --export-csv historique.csv
 ```
 
-`XXXX` = 4 derniers caractères du n° de série du disque. `--erase-file` efface un **fichier** de test
-(le certificat porte alors la mention « TEST SUR FICHIER »).
+`XXXX` = 4 derniers caractères du n° de série. `oblion.exe --gui-demo` ouvre l'interface en mode
+démonstration (disques simulés, aucun accès disque).
 
 ### Configuration
 
 Tout est relatif au dossier de l'exécutable (`data/`), rien n'est écrit ailleurs :
 - `data/config.toml` : votre société et le technicien par défaut ;
 - `data/clients.toml` : carnet de clients ;
-- `data/assets/logo.png` : logo affiché sur le certificat (optionnel).
+- `data/assets/logo.png` : logo affiché sur le certificat (optionnel) ;
+- `data/assets/fonts/` : police `.ttf` optionnelle si le système n'en a pas (WinPE minimal).
+
+### Captures
+
+| | |
+|---|---|
+| ![Configuration](docs/screenshots/02-configuration.png) | ![Confirmation](docs/screenshots/03-confirmation.png) |
+| ![Effacement](docs/screenshots/04-effacement.png) | ![Certificat](docs/screenshots/05-certificat.png) |
+| ![Historique](docs/screenshots/06-historique.png) | ![Paramètres](docs/screenshots/07-parametres.png) |
 
 ### Compilation
 
@@ -71,7 +101,7 @@ Ce projet n'utilise pas le code de nwipe (GPLv2) : seule la structure du rapport
 
 ## English
 
-Portable Windows tool (no install, WinPE / Medicat friendly) to wipe HDDs and SSDs and produce
-a PDF erasure certificate. Student project, work in progress — see the warning above.
-Overwrite methods are reported as NIST 800-88 **Clear**; **Purge** is only reported after a
-successful firmware sanitize command (planned). MIT licensed.
+Portable Windows tool (no install, WinPE / Medicat friendly) to wipe HDDs, SATA SSDs and NVMe drives
+and produce a PDF erasure certificate. `oblion.exe` is the GUI (software rendering, no GPU needed),
+`oblion-cli.exe` the console version. Overwrites are reported as NIST 800-88 **Clear**; **Purge** is only
+reported after a successful firmware sanitize command confirmed by marker verification. MIT licensed.

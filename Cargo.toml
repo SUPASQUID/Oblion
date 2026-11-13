@@ -1,5 +1,5 @@
 [package]
-name = "diskerase"
+name = "oblion"
 version = "0.1.0"
 edition = "2021"
 description = "Outil portable d'effacement sécurisé de disques (HDD/SSD) avec certificat PDF"
@@ -8,13 +8,15 @@ publish = false
 
 [dependencies]
 barcoders = { version = "2.0.0", default-features = false, features = ["std"] }
+iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "canvas", "crisp"] }
 png = "0.18.1"
 qrcode = { version = "0.14.1", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.2.1"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Registry", "Win32_System_SystemInformation"] }
-# printpdf, GUI, etc. ajoutés au fil des étapes
+toml_edit = "0.25.19"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# Interface graphique : iced, rendu logiciel tiny-skia UNIQUEMENT (aucun backend GPU : WinPE)
 
 [profile.release]
 opt-level = 3

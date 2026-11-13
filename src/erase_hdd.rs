@@ -840,7 +840,7 @@ pub(crate) mod tests {
 
     #[test]
     fn file_device_refuses_empty_file() {
-        let path = std::env::temp_dir().join(format!("diskerase-empty-{}.img", std::process::id()));
+        let path = std::env::temp_dir().join(format!("oblion-empty-{}.img", std::process::id()));
         std::fs::write(&path, b"").unwrap();
         assert!(FileDevice::open(&path).is_err());
         let _ = std::fs::remove_file(&path);
@@ -937,7 +937,7 @@ pub(crate) mod tests {
 
     #[test]
     fn file_device_roundtrip() {
-        let path = std::env::temp_dir().join(format!("diskerase-fd-{}.img", std::process::id()));
+        let path = std::env::temp_dir().join(format!("oblion-fd-{}.img", std::process::id()));
         std::fs::write(&path, vec![0xAAu8; 64 * 1024]).unwrap();
         let mut dev = FileDevice::open(&path).unwrap();
         let o = erase(

@@ -190,12 +190,21 @@ impl Default for EraseCfg {
     }
 }
 
+/// Préférences de l'interface graphique.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiCfg {
+    /// « light » (défaut) ou « dark ».
+    pub theme: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub company: Company,
     pub technician: Technician,
     pub erase: EraseCfg,
+    pub ui: UiCfg,
 }
 
 impl Config {
@@ -230,12 +239,83 @@ impl Config {
     }
 }
 
+/// Enregistre société, technicien et thème dans `config.toml` en CONSERVANT les autres
+/// sections et clés (ex. [erase]). Le texte produit est revalidé avant l'écriture
+/// (écriture atomique : fichier temporaire puis renommage).
+pub fn save_settings(
+    path: &Path,
+    company: &Company,
+    technician: &Technician,
+    theme: &str,
+) -> Result<(), String> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("lecture de {} impossible : {e}", path.display())),
+    };
+    let out = merge_settings(&text, company, technician, theme)?;
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, out.as_bytes())
+        .and_then(|_| fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!(
+                "enregistrement de {} impossible (dossier en lecture seule ?) : {e}",
+                path.display()
+            )
+        })
+}
+
+/// Fusion pure (testable) : remplace [company], [technician] et [ui].theme.
+pub fn merge_settings(
+    text: &str,
+    company: &Company,
+    technician: &Technician,
+    theme: &str,
+) -> Result<String, String> {
+    // toml_edit : commentaires, ordre des clés et mise en forme sont conservés.
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e| format!("config.toml invalide : {e}"))?;
+    let mut set = |section: &str, key: &str, value: &str| -> Result<(), String> {
+        if !doc.contains_key(section) {
+            doc.insert(section, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let table = doc[section]
+            .as_table_like_mut()
+            .ok_or_else(|| format!("config.toml invalide : [{section}] n'est pas une table"))?;
+        match table.get_mut(key) {
+            // Valeur existante : on garde ses décorations (commentaire en fin de ligne).
+            Some(item) if item.is_value() => {
+                let decor = item.as_value().map(|v| v.decor().clone());
+                *item = toml_edit::value(value);
+                if let (Some(d), Some(v)) = (decor, item.as_value_mut()) {
+                    *v.decor_mut() = d;
+                }
+            }
+            _ => {
+                table.insert(key, toml_edit::value(value));
+            }
+        }
+        Ok(())
+    };
+    set("company", "name", &company.name)?;
+    set("company", "address", &company.address)?;
+    set("company", "contact_name", &company.contact_name)?;
+    set("company", "phone", &company.phone)?;
+    set("technician", "name", &technician.name)?;
+    set("ui", "theme", theme)?;
+    let out = doc.to_string();
+    Config::parse(&out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("diskerase-test-{name}-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("oblion-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -281,6 +361,67 @@ mod tests {
             .contains("zz"));
         assert!(Config::parse("[erase]\nverify = \"parfois\"").is_err());
         assert!(Config::parse("[erase]\nhdd_passes = [\"0xAA\"]\nverify = \"all\"").is_ok());
+    }
+
+    #[test]
+    fn settings_are_saved_and_other_sections_kept() {
+        let text = "[company]
+name = \"Ancienne\"
+[erase]
+hdd_passes = [\"0xAA\"]
+verify = \"all\"
+";
+        let company = Company {
+            name: "Nouvelle".into(),
+            phone: "01".into(),
+            ..Default::default()
+        };
+        let tech = Technician {
+            name: "Tech".into(),
+        };
+        let out = merge_settings(text, &company, &tech, "dark").unwrap();
+        // Commentaires et ordre conservés.
+        let commented = "# Mon commentaire en tête
+[company]
+name = \"A\" # nom légal
+
+# section effacement
+[erase]
+verify = \"all\"
+";
+        let out2 = merge_settings(commented, &company, &tech, "dark").unwrap();
+        assert!(out2.starts_with("# Mon commentaire en tête"), "{out2}");
+        assert!(out2.contains("# nom légal"), "{out2}");
+        assert!(out2.contains("# section effacement"), "{out2}");
+        assert!(out2.find("[company]").unwrap() < out2.find("[erase]").unwrap());
+        assert!(out2.contains("name = \"Nouvelle\""), "{out2}");
+        let c = Config::parse(&out).unwrap();
+        assert_eq!(c.company, company);
+        assert_eq!(c.technician, tech);
+        assert_eq!(c.ui.theme, "dark");
+        assert_eq!(c.erase.hdd_passes, vec!["0xAA"]);
+        assert_eq!(c.erase.verify, "all");
+        // Fichier vide ou absent : valeurs par défaut pour le reste.
+        let out = merge_settings("", &company, &tech, "light").unwrap();
+        assert_eq!(Config::parse(&out).unwrap().erase, EraseCfg::default());
+        // Fichier invalide : erreur, rien n'est écrasé.
+        assert!(merge_settings("[company", &company, &tech, "light").is_err());
+        // Écriture réelle dans un dossier temporaire.
+        let dir = tmp("save");
+        let path = dir.join("config.toml");
+        fs::write(&path, text).unwrap();
+        save_settings(&path, &company, &tech, "dark").unwrap();
+        assert_eq!(Config::load(&path).unwrap().company.name, "Nouvelle");
+        // Dossier inexistant (= support en lecture seule) : message clair.
+        let e = save_settings(
+            &dir.join("absent").join("config.toml"),
+            &company,
+            &tech,
+            "dark",
+        )
+        .unwrap_err();
+        assert!(e.contains("lecture seule"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -306,7 +306,11 @@ fn page1(rec: &EraseRecord, logo: Option<(u32, u32)>, generated: &str) -> Page {
             y + 14.0,
             10.0,
             Font::SansBold,
-            "TEST SUR FICHIER — ce certificat ne concerne pas un disque physique",
+            if rec.demo {
+                crate::report::NOTE_DEMO
+            } else {
+                "TEST SUR FICHIER — ce certificat ne concerne pas un disque physique"
+            },
         );
         y += 26.0;
     }
@@ -793,6 +797,10 @@ mod tests {
         let mut r = sample_record();
         r.test_target = true;
         assert!(contains(&render(&r, None), "TEST SUR FICHIER"));
+        r.demo = true;
+        let pdf = render(&r, None);
+        assert!(!contains(&pdf, "TEST SUR FICHIER"));
+        assert!(contains(&pdf, "aucun disque r"));
     }
 
     #[test]
@@ -975,6 +983,6 @@ mod tests {
         assert_eq!(nice_max(127.1), 200.0);
         assert_eq!(nice_max(96.0), 100.0);
         assert_eq!(nice_max(0.0), 1.0);
-        assert!(Code128::new("ƁDE-20261109-134548-ABCDEF").is_ok());
+        assert!(Code128::new("ƁOBL-20261109-134548-ABCDEF").is_ok());
     }
 }

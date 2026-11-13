@@ -90,6 +90,11 @@ pub const SAN_FAILURE_MODE: u16 = 1 << 4;
 const DEV_LBA: u8 = 0x40;
 
 /// Mot de passe utilisateur temporaire de Security Erase (connu, affiché en cas de souci).
+///
+/// Volontairement resté « DiskErase » malgré le changement de nom en Oblion (pas APP_NAME) :
+/// c'est une valeur de protocole, pas un nom affiché. Un disque resté verrouillé par une
+/// version précédente (Security Erase interrompu) doit toujours pouvoir être déverrouillé
+/// par `remove_password` et par les instructions des notes (hdparm … DiskErase).
 pub const PASSWORD: &str = "DiskErase";
 
 // ---------- Commande / résultat ----------

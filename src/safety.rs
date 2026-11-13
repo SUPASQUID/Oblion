@@ -193,18 +193,39 @@ impl PreparedDisk {
 
     /// Le disque relu maintenant est-il bien celui qui a été confirmé ?
     pub fn check_same_disk(&self, now: &DiskInfo) -> Result<(), String> {
-        if now.number != self.number
-            || now.serial != self.serial
-            || now.display_model() != self.model
-            || now.size_bytes != self.size_bytes
-        {
-            return Err(format!(
-                "le disque {} a changé depuis la confirmation",
-                self.number
-            ));
-        }
-        Ok(())
+        same_identity(
+            (self.number, &self.serial, &self.model, self.size_bytes),
+            now,
+        )
     }
+}
+
+fn same_identity(confirmed: (u32, &str, &str, u64), now: &DiskInfo) -> Result<(), String> {
+    let (number, serial, model, size) = confirmed;
+    if now.number != number
+        || now.serial != serial
+        || now.display_model() != model
+        || now.size_bytes != size
+    {
+        return Err(format!(
+            "le disque {number} a changé depuis la confirmation"
+        ));
+    }
+    Ok(())
+}
+
+/// Même vérification que `PreparedDisk::check_same_disk`, entre le disque confirmé par
+/// l'opérateur et sa relecture juste avant l'effacement.
+pub fn same_disk(confirmed: &DiskInfo, now: &DiskInfo) -> Result<(), String> {
+    same_identity(
+        (
+            confirmed.number,
+            &confirmed.serial,
+            &confirmed.display_model(),
+            confirmed.size_bytes,
+        ),
+        now,
+    )
 }
 
 #[derive(Debug)]
@@ -388,11 +409,63 @@ impl OfflineGuard {
     }
 }
 
+/// Échecs de remise en ligne, relevés par `job` (avertissement, certificat ou journal).
+static ONLINE_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Message d'un échec de remise en ligne.
+pub fn online_failure_note(disk_number: u32, error: u32) -> String {
+    format!(
+        "Remise en ligne du disque {disk_number} impossible (erreur Windows {error}) : redémarrer ou Gestion des disques → En ligne"
+    )
+}
+
+/// Récupère (et vide) les échecs de remise en ligne survenus depuis le dernier appel.
+pub fn take_online_failures() -> Vec<String> {
+    ONLINE_FAILURES
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
+fn record_online_failure(note: String) {
+    if let Ok(mut v) = ONLINE_FAILURES.lock() {
+        v.push(note);
+    }
+}
+
 impl Drop for OfflineGuard {
     fn drop(&mut self) {
         if let Err(e) = set_offline(self.0, false) {
-            eprintln!("ATTENTION : remise en ligne du disque {} impossible (erreur {e}) ; elle se fera au redémarrage.", self.0);
+            record_online_failure(online_failure_note(self.0, e));
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_online {
+    use super::*;
+
+    #[test]
+    fn online_failures_are_kept_for_the_job_with_advice() {
+        let _ = take_online_failures();
+        record_online_failure(online_failure_note(3, 5));
+        let v = take_online_failures();
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("disque 3") && v[0].contains("Gestion des disques → En ligne"));
+        assert!(v[0].contains("redémarrer"));
+        assert!(take_online_failures().is_empty());
+    }
+
+    #[test]
+    fn same_disk_detects_a_swap() {
+        let a = tests::disk(2, "ABC123");
+        assert!(same_disk(&a, &a.clone()).is_ok());
+        let mut b = a.clone();
+        b.serial = "XYZ999".into();
+        assert!(same_disk(&a, &b).unwrap_err().contains("a changé"));
+        let mut b = a.clone();
+        b.size_bytes += 512;
+        assert!(same_disk(&a, &b).is_err());
     }
 }
 
@@ -437,7 +510,7 @@ pub(crate) mod tests {
     #[test]
     fn drive_letters() {
         assert_eq!(
-            drive_letter_of(&PathBuf::from(r"E:\DiskErase\x.exe")),
+            drive_letter_of(&PathBuf::from(r"E:\Oblion\x.exe")),
             Some('E')
         );
         assert_eq!(

@@ -133,6 +133,9 @@ pub struct EraseRecord {
     /// Taille physique réelle (HPA/DCO compris) quand elle a pu être lue.
     #[serde(default)]
     pub real_size_bytes: Option<u64>,
+    /// Mode démonstration (`--gui-demo`) : disque simulé en mémoire, aucun disque réel.
+    #[serde(default)]
+    pub demo: bool,
 }
 
 // ---------- Effacement firmware ----------
@@ -294,7 +297,10 @@ pub const NOTE_SANITIZE_HYPOTHESIS: &str = "Hypothèse : Sanitize couvre tout le
 /// Libellé du « rapport firmware » quand aucune commande n'était utilisable (repli direct).
 pub const NO_FIRMWARE_LABEL: &str = "aucune commande firmware utilisable";
 
-/// Préfixe d'ID dérivé de APP_NAME : capitales (DiskErase → DE), sinon 3 premières lettres.
+/// Note (en tête) et bandeau des certificats du mode démonstration.
+pub const NOTE_DEMO: &str = "TEST / DÉMO — aucun disque réel (disque simulé en mémoire)";
+
+/// Préfixe d'ID dérivé de APP_NAME : capitales si au moins 2 (« DiskErase » → DE), sinon 3 premières lettres (« Oblion » → OBL).
 pub fn id_prefix() -> String {
     let caps: String = APP_NAME
         .chars()
@@ -540,6 +546,7 @@ pub fn build_record(i: RecordInput) -> EraseRecord {
         test_target: i.test_target,
         ssd_overwrite: i.ssd_overwrite,
         real_size_bytes: i.real_size.or_else(|| i.hidden.real_size_bytes()),
+        demo: false,
     }
 }
 
@@ -1347,7 +1354,7 @@ pub(crate) mod tests {
         assert!(row.contains(";'+33 1 00"));
         assert!(row.contains(";'@SUM(A1);"));
         assert_eq!(csv_escape("-12"), "'-12");
-        assert_eq!(csv_escape("DE-1"), "DE-1");
+        assert_eq!(csv_escape("OBL-1"), "OBL-1");
     }
 
     #[test]
@@ -1373,14 +1380,35 @@ pub(crate) mod tests {
     #[test]
     fn id_is_stable_and_prefixed() {
         let r = sample_record();
-        assert!(r.id.starts_with("DE-20261109-134548-"), "{}", r.id);
+        assert!(r.id.starts_with("OBL-20261109-134548-"), "{}", r.id);
         assert_eq!(r.id, sample_record().id);
-        assert_eq!(r.id.len(), "DE-20261109-134548-".len() + 6);
+        assert_eq!(r.id.len(), "OBL-20261109-134548-".len() + 6);
         assert_eq!(r.passes, vec!["0x00", "0xFF", "random"]);
         assert_eq!(r.final_pass, "Aléatoire");
         assert_eq!(r.duration_hms(), "08:17:12");
         assert!((r.percent - 100.0).abs() < 1e-9);
         assert_eq!(Fill::Random.label(), "random");
+    }
+
+    #[test]
+    fn old_history_with_de_ids_and_without_demo_field_is_still_read() {
+        let mut v = serde_json::to_value(vec![sample_record()]).unwrap();
+        let r = v[0].as_object_mut().unwrap();
+        r.insert("id".into(), "DE-20261109-134548-ABCDEF".into());
+        r.remove("demo");
+        let dir = std::env::temp_dir().join(format!("oblion-hist-old-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("history.json"), serde_json::to_string(&v).unwrap()).unwrap();
+        let all = load_history(&dir).unwrap();
+        assert_eq!(all[0].id, "DE-20261109-134548-ABCDEF");
+        assert!(!all[0].demo);
+        // Un nouvel effacement s'ajoute avec le nouveau préfixe.
+        append_history(&dir, &sample_record()).unwrap();
+        let all = load_history(&dir).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[1].id.starts_with("OBL-"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1396,7 +1424,7 @@ pub(crate) mod tests {
 
     #[test]
     fn history_append_and_reload_and_corruption_is_kept() {
-        let dir = std::env::temp_dir().join(format!("diskerase-hist-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oblion-hist-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         assert!(load_history(&dir).unwrap().is_empty());
@@ -1440,7 +1468,7 @@ pub(crate) mod tests {
 
     #[test]
     fn history_io_error_stops_without_writing() {
-        let dir = std::env::temp_dir().join(format!("diskerase-hist-io-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oblion-hist-io-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         // « history.json » est un DOSSIER : la lecture échoue (E/S), rien ne doit être écrasé.
         fs::create_dir_all(dir.join("history.json")).unwrap();
