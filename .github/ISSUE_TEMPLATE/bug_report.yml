@@ -1,0 +1,113 @@
+name: Signaler un bug
+description: Un comportement incorrect d'Oblion (interface, console, certificat, paquet).
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Merci de prendre le temps de signaler un problème.
+
+        **Ne joignez jamais de données personnelles ni de n° de série complets.**
+        Masquez les n° de série (par exemple `XXXX…1234`), les noms de clients, adresses,
+        téléphones et noms de techniciens, y compris dans les captures et les certificats.
+
+        Pour une **faille de sécurité**, n'ouvrez pas d'issue : utilisez l'onglet
+        *Security* → *Report a vulnerability* (voir SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version d'Oblion
+      description: Sortie de `oblion-cli --version`.
+      placeholder: Oblion 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environnement
+    attributes:
+      label: Environnement
+      options:
+        - Windows 11
+        - Windows 10
+        - WinPE (Medicat « Mini Windows »)
+        - WinPE (autre)
+        - Autre (préciser dans la description)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: executable
+    attributes:
+      label: Exécutable concerné
+      options:
+        - oblion.exe (interface)
+        - oblion-cli.exe (console)
+        - Les deux
+        - Paquet / lanceurs (.bat)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: type-disque
+    attributes:
+      label: Type de disque
+      options:
+        - HDD
+        - SSD SATA
+        - NVMe
+        - Inconnu / sans objet
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connexion
+    attributes:
+      label: Connexion du disque
+      options:
+        - SATA en direct (carte mère)
+        - NVMe en direct (carte mère)
+        - Adaptateur ou boîtier USB
+        - Contrôleur RAID / Intel RST
+        - Disque virtuel (VHD)
+        - Autre / sans objet
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Ce que vous avez fait, ce qui était attendu, ce qui s'est passé.
+      placeholder: |
+        1. oblion-cli --erase 1 --confirm XXXX --dry-run
+        2. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: info
+    attributes:
+      label: Sortie de `oblion-cli --info N`
+      description: |
+        Commande en lecture seule (console administrateur). **Masquez le n° de série**
+        (ne laissez que les 4 derniers caractères au plus).
+      render: text
+
+  - type: textarea
+    id: certificat
+    attributes:
+      label: Notes du certificat
+      description: |
+        Statut, méthode et notes / avertissements du certificat PDF (texte recopié).
+        Ne joignez pas le PDF complet : il contient le n° de série et les informations client.
+      render: text
+
+  - type: checkboxes
+    id: confidentialite
+    attributes:
+      label: Confidentialité
+      options:
+        - label: J'ai masqué les n° de série et retiré toute donnée personnelle (clients, adresses, noms).
+          required: true

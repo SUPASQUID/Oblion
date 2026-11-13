@@ -1,0 +1,61 @@
+# Intégration continue : formatage, clippy, tests et compilation release sur Windows.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows (stable)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain Rust stable (rustfmt, clippy)
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked

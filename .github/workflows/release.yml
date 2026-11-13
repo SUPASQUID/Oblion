@@ -1,0 +1,130 @@
+# Publication : sur un tag vX.Y.Z, tests, compilation, paquet portable et GitHub Release.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Paquet Windows et release
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Le tag correspond à la version de Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $toml = Get-Content -Raw -Encoding utf8 Cargo.toml
+          $m = [regex]::Match($toml, '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"')
+          if (-not $m.Success) { throw 'version introuvable dans Cargo.toml' }
+          $version = $m.Groups[1].Value
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -ne "v$version") {
+            Write-Error "Le tag '$tag' ne correspond pas à la version de Cargo.toml (attendu : v$version)."
+            exit 1
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Version $version"
+
+      - name: Toolchain Rust stable
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Paquet portable (zip + sha256)
+        shell: pwsh
+        run: ./scripts/package.ps1 -SkipBuild
+
+      - name: Notes de version
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $version = $env:VERSION
+          $changelog = Get-Content -Raw -Encoding utf8 CHANGELOG.md
+          $pattern = '(?ms)^## \[' + [regex]::Escape($version) + '\][^\n]*\r?\n(.*?)(?=^## \[|^\[[^\]]+\]:|\z)'
+          $m = [regex]::Match($changelog, $pattern)
+          if (-not $m.Success) { throw "Section [$version] absente de CHANGELOG.md" }
+          $sha = (Get-Content -Raw "dist/Oblion-v$version.zip.sha256").Trim()
+          $hash = $sha.Split(' ')[0]
+          $body = @"
+          $($m.Groups[1].Value.Trim())
+
+          ## Téléchargement
+
+          ``Oblion-v$version.zip`` : dossier portable (interface, console, lanceurs, LISEZMOI).
+
+          SHA256 :
+          ``````
+          $sha
+          ``````
+
+          Vérification sous Windows (PowerShell) :
+          ``````
+          (Get-FileHash .\Oblion-v$version.zip -Algorithm SHA256).Hash -eq '$hash'
+          ``````
+
+          ## Exécutables non signés
+
+          ``oblion.exe`` et ``oblion-cli.exe`` ne sont pas signés : SmartScreen, le Contrôle intelligent des applications ou un antivirus peuvent les bloquer ou les signaler (l'outil accède directement aux disques). Vérifiez l'empreinte SHA256 ci-dessus avant de les utiliser.
+
+          > **Outil destructif**, fourni sans garantie ; l'auteur décline toute responsabilité en cas de perte de données.
+          "@
+          [System.IO.File]::WriteAllText("$PWD/dist/release-notes.md", $body, (New-Object System.Text.UTF8Encoding($false)))
+          Get-Content dist/release-notes.md
+
+      - name: Création de la GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag `
+            "dist/Oblion-v$($env:VERSION).zip" `
+            "dist/Oblion-v$($env:VERSION).zip.sha256" `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "Oblion $tag" `
+            --notes-file dist/release-notes.md `
+            --verify-tag
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

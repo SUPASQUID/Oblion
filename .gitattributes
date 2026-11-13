@@ -1,0 +1,7 @@
+# Fins de ligne identiques sur tous les postes et sur le runner GitHub (Windows).
+* text=auto eol=lf
+# cmd.exe exige des fins de ligne CRLF (étiquettes et goto).
+*.bat text eol=crlf
+*.png binary
+*.ico binary
+*.pdf binary

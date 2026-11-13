@@ -17,6 +17,42 @@ Outil Windows portable (sans installation, compatible WinPE / Medicat) pour effa
 durs, SSD SATA et NVMe, puis générer un certificat PDF d'effacement inspiré du rapport nwipe.
 Projet étudiant (BTS SIO). Anciennement « DiskErase ».
 
+### Avancement
+
+| Étape | Contenu | État |
+|---|---|---|
+| 1 | Détection, sécurités, écrasement HDD, certificat PDF | Terminé |
+| 2 | Corrections après test sur disque virtuel (VHD) | Terminé |
+| 3 | Effacement firmware SSD/NVMe/HDD, SMART, HPA/DCO, `--info` | Terminé (commandes firmware non validées sur matériel) |
+| 4 | Interface graphique, renommage en Oblion | Terminé |
+| 5 | Icône, paquet portable, CI et releases GitHub, documentation | Terminé |
+
+Historique détaillé : [CHANGELOG.md](CHANGELOG.md).
+
+### Télécharger
+
+Les versions sont publiées dans [Releases](https://github.com/SUPASQUID/Oblion/releases) :
+
+- `Oblion-vX.Y.Z.zip` : dossier portable à décompresser (interface, console, `Lancer.bat`,
+  `Lancer-console.bat`, `LISEZMOI.txt`, dossier `data/`) ;
+- `Oblion-vX.Y.Z.zip.sha256` : empreinte SHA256 du zip.
+
+Vérifiez l'empreinte avant utilisation (PowerShell) :
+
+```powershell
+Get-FileHash .\Oblion-vX.Y.Z.zip -Algorithm SHA256
+```
+
+Le résultat doit être identique au hash du fichier `.sha256` (et à celui affiché sur la
+page de la release). Ensuite : décompresser, puis double-cliquer sur `Lancer.bat`.
+
+### Exe non signé
+
+`oblion.exe` et `oblion-cli.exe` ne sont pas signés numériquement. SmartScreen, le Contrôle
+intelligent des applications ou un antivirus peuvent les bloquer ou les signaler, d'autant
+que l'outil accède directement aux disques (accès « bruts »). Téléchargez Oblion uniquement
+depuis la page Releases de ce dépôt et vérifiez le SHA256 ci-dessus.
+
 ### Deux exécutables
 
 | Fichier | Rôle |
@@ -54,8 +90,7 @@ Les deux appellent exactement le même code d'effacement et les mêmes sécurit�
   et certains pilotes RAID / Intel RST bloquent les commandes d'effacement firmware. Tout refus est
   indiqué sur le certificat.
 - Lancez en **administrateur**.
-- L'exécutable n'est pas signé : SmartScreen / le Contrôle intelligent des applications peuvent le
-  bloquer (désactivation temporaire, ou lancement depuis Medicat / WinPE).
+- L'exécutable n'est pas signé : voir [Exe non signé](#exe-non-signé).
 - Security Erase (ATA) impose un mot de passe temporaire (`DiskErase`), retiré automatiquement ;
   il est indiqué sur le certificat si le retrait échoue.
 
@@ -81,6 +116,13 @@ Tout est relatif au dossier de l'exécutable (`data/`), rien n'est écrit ailleu
 - `data/assets/logo.png` : logo affiché sur le certificat (optionnel) ;
 - `data/assets/fonts/` : police `.ttf` optionnelle si le système n'en a pas (WinPE minimal).
 
+### Utilisation depuis Medicat
+
+Copiez le dossier décompressé sur la partition de données de la clé (par exemple dans un
+dossier `Oblion`), démarrez sur le Windows PE de Medicat, puis lancez `Lancer.bat` depuis
+l'explorateur. La clé qui contient l'outil est protégée automatiquement. Procédure
+détaillée : [docs/medicat.md](docs/medicat.md).
+
 ### Captures
 
 | | |
@@ -96,6 +138,25 @@ cargo test
 cargo build --release
 ```
 Cible `x86_64-pc-windows-msvc`, CRT liée statiquement (aucun runtime Visual C++ requis).
+L'icône des exécutables est générée à la compilation depuis `assets/oblion-logo.svg` ; les
+ressources Windows (icône, informations de version) demandent `rc.exe` du Windows SDK
+(installé avec les Build Tools de Visual Studio).
+
+Paquet portable (zip + `.sha256` dans `dist/`) :
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\package.ps1
+```
+
+Les releases sont produites par GitHub Actions lors d'un tag `vX.Y.Z` (identique à la version
+de `Cargo.toml`). Signalement des failles : [SECURITY.md](SECURITY.md).
+
+### Licences tierces
+
+Oblion est sous licence MIT. Les exécutables incluent des bibliothèques Rust sous licences
+MIT, Apache-2.0, BSD, Zlib, BSL-1.0, etc. Leur liste et leurs textes complets sont dans
+`THIRD-PARTY-LICENSES.txt`, fourni dans le zip et généré par
+`scripts/third-party-licenses.ps1` (à partir de `cargo tree` et du registre cargo local).
 
 Ce projet n'utilise pas le code de nwipe (GPLv2) : seule la structure du rapport sert de référence.
 

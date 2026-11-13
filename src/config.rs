@@ -321,6 +321,27 @@ mod tests {
         p
     }
 
+    /// Modèles livrés dans le zip (scripts/package.ps1) : valides, vides et sans client réel.
+    #[test]
+    fn packaged_templates_are_valid_and_empty() {
+        let c = Config::parse(include_str!("../packaging/data/config.toml")).unwrap();
+        assert_eq!(c.company, Company::default());
+        assert_eq!(c.technician, Technician::default());
+        assert_eq!(c.erase, EraseCfg::default());
+        assert_eq!(c.ui.theme, "light");
+        let book = parse_clients(include_str!("../packaging/data/clients.toml")).unwrap();
+        assert!(book.is_empty());
+        // L'exemple commenté s'active tel quel en retirant les « # ».
+        let example: String = include_str!("../packaging/data/clients.toml")
+            .lines()
+            .filter_map(|l| l.strip_prefix("# "))
+            .filter(|l| l.starts_with('[') || l.contains(" = "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let book = parse_clients(&example).unwrap();
+        assert_eq!(book["exemple"].name, "Client Exemple");
+    }
+
     #[test]
     fn parses_config_with_defaults() {
         let c = Config::parse(

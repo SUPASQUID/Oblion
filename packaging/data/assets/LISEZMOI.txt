@@ -1,0 +1,11 @@
+Dossier assets (facultatif)
+===========================
+
+logo.png
+    Logo de votre société, affiché en haut du certificat PDF.
+    Déposez ici un fichier nommé exactement « logo.png ».
+
+fonts\
+    Police .ttf ou .otf pour l'interface graphique, à déposer dans un dossier
+    « fonts » créé ici. Utile seulement si le Windows utilisé n'a ni Segoe UI,
+    ni Arial, ni Tahoma (certains WinPE minimaux).

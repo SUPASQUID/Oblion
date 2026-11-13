@@ -1,0 +1,24 @@
+# Configuration d'Oblion (lue au démarrage ; aussi modifiable dans l'écran Paramètres).
+# Les valeurs vides sont simplement absentes du certificat PDF.
+
+# Votre société (bloc « Société » du certificat).
+[company]
+name = ""            # ex. "Ma Société"
+address = ""         # ex. "1 rue Exemple, 00000 Exempleville"
+contact_name = ""    # ex. "Service informatique"
+phone = ""           # ex. "01 00 00 00 00"
+
+# Technicien par défaut (remplaçable avec --technician "Nom").
+[technician]
+name = ""
+
+# Écrasement des HDD (si aucune commande firmware n'est utilisée).
+[erase]
+# Motifs des passes : "0x00", "0xFF", "random" ou un octet "0xNN" (défaut : DoD 5220.22-M).
+hdd_passes = ["0x00", "0xFF", "random"]
+# Vérification : "last" (dernière passe), "all" (toutes) ou "none".
+verify = "last"
+
+# Interface graphique.
+[ui]
+theme = "light"      # "light" ou "dark"

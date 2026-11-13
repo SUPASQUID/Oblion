@@ -1,0 +1,12 @@
+# Carnet de clients : une table par client, l'identifiant court sert avec --client <id>
+# (et dans la liste « Client » de l'interface).
+# Les options --customer, --customer-address, --customer-contact, --customer-phone
+# remplacent champ par champ les valeurs ci-dessous.
+#
+# Exemple FICTIF (retirer les « # » pour l'activer) :
+#
+# [clients.exemple]
+# name = "Client Exemple"
+# address = "1 rue Exemple, 00000 Exempleville"
+# contact_name = "Service informatique"
+# phone = "01 00 00 00 00"

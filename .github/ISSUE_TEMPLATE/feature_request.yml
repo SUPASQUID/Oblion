@@ -1,0 +1,48 @@
+name: Proposer une amélioration
+description: Une idée de fonctionnalité ou d'amélioration pour Oblion.
+title: "[Idée] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Merci pour votre proposition. Oblion reste volontairement simple et prudent :
+        les demandes qui affaiblissent les sécurités (protection du disque système,
+        confirmation par n° de série, statut calculé du certificat) ne seront pas retenues.
+
+        **Ne joignez aucune donnée personnelle ni n° de série complet.**
+
+  - type: textarea
+    id: besoin
+    attributes:
+      label: Besoin
+      description: Quel problème voulez-vous résoudre ? Dans quel contexte (atelier, WinPE, parc…) ?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposition
+    attributes:
+      label: Proposition
+      description: Comment l'imaginez-vous (interface, option console, certificat…) ?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives envisagées
+      description: Autres solutions ou contournements actuels.
+
+  - type: dropdown
+    id: partie
+    attributes:
+      label: Partie concernée
+      multiple: true
+      options:
+        - Interface (oblion.exe)
+        - Console (oblion-cli.exe)
+        - Certificat PDF
+        - Méthodes d'effacement
+        - Paquet / WinPE / Medicat
+        - Documentation

@@ -1,0 +1,92 @@
+OBLION {VERSION} - effacement sécurisé de disques (HDD, SSD SATA, NVMe)
+==========================================================================
+
+Outil Windows portable, sans installation : effacement de disques durs, SSD SATA
+et NVMe, puis certificat PDF d'effacement. Fonctionne sous Windows 10/11 et sous
+WinPE (par exemple le « Mini Windows » de Medicat).
+
+ATTENTION : OUTIL DESTRUCTIF
+----------------------------
+Oblion efface DÉFINITIVEMENT les données des disques choisis. Il est fourni tel
+quel, SANS AUCUNE GARANTIE ; l'auteur décline toute responsabilité en cas de perte
+de données ou de dommage (voir le fichier LICENSE). Vérifiez deux fois le disque
+choisi avant de confirmer.
+
+
+DÉMARRAGE RAPIDE
+----------------
+1. Branchez le disque à effacer EN DIRECT (SATA ou NVMe sur la carte mère).
+2. Double-cliquez sur « Lancer.bat » : il demande les droits administrateur
+   puis ouvre l'interface (oblion.exe).
+3. Choisissez le disque, vérifiez la méthode proposée, confirmez avec les
+   4 derniers caractères du n° de série.
+4. Le certificat PDF est enregistré dans data\certificates.
+
+Mode console : double-cliquez sur « Lancer-console.bat », puis par exemple :
+   oblion-cli --list
+   oblion-cli --info N
+   oblion-cli --erase N --confirm XXXX --dry-run     (simulation, n'écrit rien)
+   oblion-cli --erase N --confirm XXXX --client exemple --tag INV-001
+   oblion-cli --history
+   oblion-cli --help
+(N = numéro du disque dans --list, XXXX = 4 derniers caractères du n° de série)
+
+« oblion.exe --gui-demo » ouvre l'interface en démonstration (disques simulés,
+aucun accès disque) pour découvrir l'outil sans risque.
+
+
+CONTENU DU DOSSIER
+------------------
+oblion.exe                  interface graphique (rendu logiciel, aucun GPU requis)
+oblion-cli.exe              version console (scripts, codes de retour, WinPE minimal)
+Lancer.bat                  lance l'interface en administrateur
+Lancer-console.bat          ouvre une console administrateur dans ce dossier
+data\config.toml            votre société et le technicien par défaut (à remplir)
+data\clients.toml           carnet de clients (exemple fictif en commentaire)
+data\assets\                logo.png du certificat et polices (optionnels)
+data\certificates\          certificats PDF produits
+data\history\               historique des effacements
+data\logs\                  journaux
+LICENSE                     licence d'Oblion (MIT)
+THIRD-PARTY-LICENSES.txt    licences des bibliothèques incluses
+
+Tout est lu et écrit dans ce dossier (data\) : rien dans le registre ni ailleurs.
+Si le dossier est en lecture seule, les fichiers produits vont dans un dossier
+temporaire indiqué à l'écran : copiez-les avant d'éteindre.
+
+
+CONSEILS
+--------
+- Branchez le disque en direct (SATA ou NVMe sur la carte mère), PAS sur un
+  adaptateur ou un boîtier USB : la plupart bloquent les commandes d'effacement
+  du firmware (Sanitize, Security Erase). Certains pilotes RAID / Intel RST aussi.
+  Tout refus est indiqué sur le certificat.
+- Lancez en administrateur (Lancer.bat le fait pour vous).
+- Le disque du Windows en cours et la clé qui contient Oblion sont protégés :
+  l'outil refuse de les effacer.
+- Les exécutables ne sont pas signés : SmartScreen, le Contrôle intelligent des
+  applications ou un antivirus peuvent les bloquer ou les signaler (l'outil accède
+  directement aux disques). Téléchargez Oblion uniquement depuis la page Releases
+  du dépôt GitHub et vérifiez l'empreinte SHA256 du zip :
+     Get-FileHash .\Oblion-v{VERSION}.zip -Algorithm SHA256
+  puis comparez avec le fichier Oblion-v{VERSION}.zip.sha256 de la release.
+
+
+UTILISATION DEPUIS MEDICAT / WINPE
+----------------------------------
+1. Copiez ce dossier complet sur la partition de données de la clé (par exemple
+   dans un dossier « Oblion » à la racine).
+2. Démarrez le PC sur la clé, choisissez l'environnement Windows PE (« Mini
+   Windows » dans Medicat ; les menus peuvent varier selon la version).
+3. Ouvrez l'explorateur de fichiers, allez dans le dossier Oblion et lancez
+   « Lancer.bat » (sous WinPE on est déjà administrateur).
+4. La clé qui contient Oblion est détectée et protégée automatiquement : elle
+   est marquée « Clé de démarrage » et ne peut pas être effacée. Si Oblion est
+   lancé depuis le lecteur X: de WinPE (copié en RAM), la clé d'origine ne peut
+   pas être identifiée : tous les disques USB sont alors protégés.
+Si l'interface ne peut pas démarrer (WinPE très minimal), utilisez
+« Lancer-console.bat » et oblion-cli.exe.
+
+
+Code source, documentation et signalement des problèmes :
+https://github.com/SUPASQUID/Oblion
