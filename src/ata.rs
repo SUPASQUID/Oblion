@@ -200,6 +200,23 @@ impl fmt::Display for AtaError {
     }
 }
 
+/// Codes Windows renvoyés par DeviceIoControl LUI-MÊME quand le pilote ou le pont USB refuse
+/// la requête ATA : 1 (ERROR_INVALID_FUNCTION), 50 (ERROR_NOT_SUPPORTED),
+/// 87 (ERROR_INVALID_PARAMETER).
+pub const TRANSPORT_REFUSALS: [u32; 3] = [1, 50, 87];
+
+impl AtaError {
+    /// Code Windows si la commande a été refusée par Windows, le pilote ou l'adaptateur AVANT
+    /// d'atteindre le disque (méthode « indisponible ») ; None si elle a pu atteindre le disque
+    /// (ABRT, délai, autre erreur de transport) ou n'a pas été envoyée pour une autre raison.
+    pub fn transport_refusal(&self) -> Option<u32> {
+        match self {
+            AtaError::Windows(c) if TRANSPORT_REFUSALS.contains(c) => Some(*c),
+            _ => None,
+        }
+    }
+}
+
 /// Port ATA : envoi d'une commande, retour des registres de sortie et des données.
 pub trait AtaPort {
     fn exec(&mut self, cmd: &AtaCmd) -> Result<AtaResult, AtaError>;

@@ -328,11 +328,17 @@ pub fn decision_reason(a: &Analysis, probe: &Probe) -> String {
         Decision::Firmware(_) => {
             let ex = erase_ssd::explain(&probe.caps, a.media, &a.choice);
             format!(
-                "{}. Purge seulement si la commande réussit ET que les {} marqueurs posés avant sont tous effacés.",
+                "{}{}. Purge seulement si la commande réussit ET que les {} marqueurs posés avant sont tous effacés.",
+                blocked_prefix(probe),
                 ex.last().cloned().unwrap_or_default(),
                 erase_ssd::MARKER_COUNT + 2
             )
         }
+        Decision::Fallback if matches!(a.choice, Choice::Blocked { .. }) => format!(
+            "{}{} Repli : TRIM complet (si supporté) puis une passe aléatoire vérifiée, statut au mieux PARTIAL.",
+            blocked_prefix(probe),
+            erase_ssd::FIRMWARE_BLOCKED_MSG
+        ),
         Decision::Overwrite { ssd: true, .. } => format!("{} — statut au mieux PARTIAL.", report::NOTE_SSD),
         Decision::Overwrite { note: Some(n), .. } => format!("{n}."),
         Decision::Overwrite { .. } => "Écrase chaque secteur selon les passes configurées puis relit pour contrôler. Méthode adaptée aux disques magnétiques (NIST Clear).".into(),
@@ -340,6 +346,21 @@ pub fn decision_reason(a: &Analysis, probe: &Probe) -> String {
         Decision::Refuse(e) => e.clone(),
         Decision::Frozen(g) => g.clone(),
     }
+}
+
+/// « ATA Sanitize bloqué par le pilote ou l'adaptateur (erreur Windows 50). » si la sonde
+/// l'a détecté, sinon chaîne vide.
+pub fn blocked_prefix(probe: &Probe) -> String {
+    probe
+        .caps
+        .ata_sanitize_blocked
+        .map(|c| {
+            format!(
+                "{}. ",
+                erase_ssd::blocked_note(FwMethod::AtaSanitizeCrypto, c)
+            )
+        })
+        .unwrap_or_default()
 }
 
 /// Débit supposé pour l'estimation d'un écrasement (hypothèse affichée comme telle).
@@ -417,6 +438,10 @@ pub struct Finished {
     /// Remarques connues APRÈS l'écriture du PDF (ex. remise en ligne impossible) :
     /// journal + écran Résultat.
     pub late_notes: Vec<String>,
+    /// Toutes les méthodes firmware ont été refusées par Windows, le pilote ou l'adaptateur,
+    /// aucune commande n'a atteint le disque et le repli n'était pas autorisé : proposer
+    /// l'écrasement (NIST Clear) à l'opérateur.
+    pub firmware_blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -724,6 +749,7 @@ fn write_outputs(c: &mut Ctx, rec: &EraseRecord) -> Result<Finished, String> {
         pdf: pdf_path,
         code: if rec.status == Status::Erased { 0 } else { 2 },
         late_notes: Vec::new(),
+        firmware_blocked: false,
     })
 }
 
@@ -860,6 +886,7 @@ fn run_firmware_erase(
     ));
     let ctx = erase_ssd::FwContext {
         method: m,
+        then: erase_ssd::next_methods(&probe.caps, media, probe.caps.frozen(), m),
         media,
         caps: &probe.caps,
         seed: o.plan.seed,
@@ -884,9 +911,20 @@ fn run_firmware_erase(
     notes.extend(run.notes.iter().cloned());
     let cancelled = c.cancel.load(Ordering::SeqCst);
 
+    for (b, code) in &run.blocked {
+        c.warn(format!(
+            "ATTENTION : {}",
+            erase_ssd::blocked_note(*b, *code)
+        ));
+    }
+    let blocked_dead_end = run.all_blocked() && !o.allow_fallback;
     if run.failed() && run.attempted && run.maybe_busy {
         c.warn(format!("ATTENTION : {}", erase_ssd::NOTE_NO_FALLBACK_BUSY));
         notes.insert(0, erase_ssd::NOTE_NO_FALLBACK_BUSY.to_string());
+    } else if blocked_dead_end {
+        c.warn(erase_ssd::FIRMWARE_BLOCKED_MSG);
+        notes.push(erase_ssd::FIRMWARE_BLOCKED_MSG.to_string());
+        notes.push("Repli non autorisé (option --allow-fallback absente)".into());
     } else if run.failed() && !o.allow_fallback {
         notes.push("Repli non autorisé (option --allow-fallback absente)".into());
     }
@@ -922,7 +960,10 @@ fn run_firmware_erase(
     input.ssd_overwrite = false;
     input.firmware = Some(run.report.clone());
     let rec = build(input, &target);
-    finish(c, &rec)
+    finish(c, &rec).map(|mut f| {
+        f.firmware_blocked = blocked_dead_end && !cancelled;
+        f
+    })
 }
 
 /// Effacement complet d'un disque : barrière, capacités (lecture seule), décision,
@@ -1092,7 +1133,10 @@ pub fn erase_disk(
                 fallback: None,
                 critical: Vec::new(),
             };
-            let notes = target.notes.clone();
+            let mut notes = target.notes.clone();
+            if let erase_ssd::Choice::Blocked { blocked } = &a.choice {
+                notes.extend(blocked.iter().map(|(m, c)| erase_ssd::blocked_note(*m, *c)));
+            }
             run_fallback_erase(
                 c,
                 &mut *dev,

@@ -731,6 +731,15 @@ fn config(app: &App) -> El<'_> {
     let mut methods: Vec<El<'_>> = vec![t("Méthode d'effacement", 14.0, p.text)
         .font(f.strong)
         .into()];
+    if let Some(h) = &form.hint {
+        let (_, ink) = Tone::Warn.colors(&p);
+        methods.push(
+            tone_panel(p, Tone::Warn, t(h.clone(), 12.0, ink).font(f.strong))
+                .padding([8, 12])
+                .width(Fill)
+                .into(),
+        );
+    }
     if form.options.is_empty() {
         methods.push(
             t(
@@ -1677,8 +1686,62 @@ fn result(app: &App) -> El<'_> {
             if let Some(e) = &app.notice {
                 notes.push(t(e.clone(), 13.0, p.danger).font(f.strong).into());
             }
+            // Commandes firmware toutes bloquées par le transport : pas de cul-de-sac.
+            let clear = app
+                .form
+                .as_ref()
+                .and_then(|form| state::clear_option(fin.firmware_blocked, &form.options));
+            if fin.firmware_blocked {
+                let (_, ink) = Tone::Warn.colors(&p);
+                notes.push(
+                    tone_panel(
+                        p,
+                        Tone::Warn,
+                        t(crate::erase_ssd::FIRMWARE_BLOCKED_MSG, 14.0, ink).font(f.strong),
+                    )
+                    .padding([10, 14])
+                    .width(Fill)
+                    .into(),
+                );
+            }
             let pdf = fin.pdf.clone();
             let dir = pdf.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+            let mut buttons = vec![
+                btn(
+                    p,
+                    f,
+                    "Ouvrir le dossier",
+                    Btn::Secondary,
+                    Some(Message::OpenFolder(dir, Some(pdf.clone()))),
+                ),
+                btn(
+                    p,
+                    f,
+                    "Ouvrir le certificat PDF",
+                    Btn::Secondary,
+                    Some(Message::OpenPdf(pdf.clone())),
+                ),
+            ];
+            if let Some(i) = clear {
+                buttons.push(btn(
+                    p,
+                    f,
+                    "Effacer par écrasement (NIST Clear)",
+                    Btn::Primary,
+                    Some(Message::RetryClear(i)),
+                ));
+            }
+            buttons.push(btn(
+                p,
+                f,
+                "Effacer un autre disque",
+                if clear.is_some() {
+                    Btn::Secondary
+                } else {
+                    Btn::Primary
+                },
+                Some(Message::NewErase),
+            ));
             column![
                 steps(p, f, 5),
                 banner,
@@ -1689,33 +1752,7 @@ fn result(app: &App) -> El<'_> {
                     t(app.shown(&pdf), 13.0, p.text).font(f.mono),
                 ],
                 space().height(Fill),
-                footer(
-                    p,
-                    space().into(),
-                    vec![
-                        btn(
-                            p,
-                            f,
-                            "Ouvrir le dossier",
-                            Btn::Secondary,
-                            Some(Message::OpenFolder(dir, Some(pdf.clone())))
-                        ),
-                        btn(
-                            p,
-                            f,
-                            "Ouvrir le certificat PDF",
-                            Btn::Secondary,
-                            Some(Message::OpenPdf(pdf))
-                        ),
-                        btn(
-                            p,
-                            f,
-                            "Effacer un autre disque",
-                            Btn::Primary,
-                            Some(Message::NewErase)
-                        ),
-                    ]
-                ),
+                footer(p, space().into(), buttons),
             ]
             .spacing(16)
             .into()

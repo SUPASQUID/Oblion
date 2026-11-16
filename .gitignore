@@ -11,3 +11,5 @@ data/logs/*
 *.img
 *.vhd
 *.vhdx
+
+/demo-disk/

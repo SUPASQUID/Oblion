@@ -30,6 +30,9 @@ pub struct Caps {
     pub ata: Option<Identify>,
     /// SANITIZE STATUS EXT lu avant l'effacement (détecte le Sanitize Freeze Lock).
     pub ata_sanitize: Option<SanitizeStatus>,
+    /// SANITIZE STATUS EXT refusé par Windows, le pilote ou l'adaptateur (code Windows) :
+    /// l'opcode B4h n'atteint pas le disque, ATA Sanitize est « bloqué ».
+    pub ata_sanitize_blocked: Option<u32>,
     pub nvme: Option<NvmeController>,
     pub nvme_ns: Option<NvmeNamespace>,
     /// StorageDeviceTrimProperty (Windows) : TRIM activé.
@@ -49,6 +52,16 @@ impl Caps {
         Frozen {
             security: self.ata.as_ref().is_some_and(|i| i.security.frozen),
             sanitize: self.ata_sanitize.is_some_and(|s| s.frozen),
+        }
+    }
+
+    /// Code Windows si la méthode est déjà connue comme bloquée par le transport.
+    pub fn transport_blocked(&self, m: FwMethod) -> Option<u32> {
+        match m {
+            FwMethod::AtaSanitizeCrypto
+            | FwMethod::AtaSanitizeBlock
+            | FwMethod::AtaSanitizeOverwrite => self.ata_sanitize_blocked,
+            _ => None,
         }
     }
 
@@ -113,6 +126,16 @@ impl FwMethod {
             }
             FwMethod::NvmeFormatCrypto | FwMethod::NvmeFormatUserData => FirmwareKind::Format,
             _ => FirmwareKind::Sanitize,
+        }
+    }
+
+    /// Nom de la famille de commandes (même opcode), pour les notes de blocage.
+    pub fn family(&self) -> &'static str {
+        match self {
+            FwMethod::AtaSanitizeCrypto
+            | FwMethod::AtaSanitizeBlock
+            | FwMethod::AtaSanitizeOverwrite => "ATA Sanitize",
+            other => other.label(),
         }
     }
 
@@ -217,23 +240,75 @@ pub enum Choice {
     },
     /// SSD/NVMe/inconnu sans commande firmware utilisable.
     Unavailable,
+    /// SSD/NVMe/inconnu : commandes supportées par le disque mais toutes refusées par
+    /// Windows, le pilote ou l'adaptateur (code Windows), rien n'atteint le disque.
+    Blocked {
+        blocked: Vec<(FwMethod, u32)>,
+    },
+}
+
+/// Message d'impasse : toutes les commandes firmware sont bloquées par le transport.
+pub const FIRMWARE_BLOCKED_MSG: &str = "Les commandes d'effacement firmware sont bloquées (adaptateur USB, pilote RAID/RST ou mode non-AHCI). \
+     Branchez le disque en SATA direct, en mode AHCI, pour obtenir Purge, ou effacez par écrasement (Clear).";
+
+/// Note du certificat / de l'écran pour une méthode refusée par le transport.
+pub fn blocked_note(m: FwMethod, code: u32) -> String {
+    format!(
+        "{} bloqué par le pilote ou l'adaptateur (erreur Windows {code})",
+        m.family()
+    )
 }
 
 /// Choix PUR de la méthode.
 /// SSD SATA : Sanitize Crypto > Sanitize Block > Security Erase Enhanced > Normal.
 /// NVMe : Sanitize Crypto > Sanitize Block > Format SES=2 > Format SES=1.
 /// HDD SATA : Sanitize Crypto > Sanitize Overwrite > Security Erase (Enhanced > Normal) > DoD.
+/// Une méthode déjà connue comme bloquée par le transport est sautée (la suivante est retenue).
 pub fn choose(caps: &Caps, media: MediaType, frozen: Frozen) -> Choice {
     let all = candidates(caps, media);
-    if let Some(m) = all.iter().find(|m| !m.blocked_by(frozen)) {
+    let usable: Vec<FwMethod> = all
+        .iter()
+        .copied()
+        .filter(|m| caps.transport_blocked(*m).is_none())
+        .collect();
+    if let Some(m) = usable.iter().find(|m| !m.blocked_by(frozen)) {
         return Choice::Firmware(*m);
     }
-    match (all.is_empty(), media == MediaType::Hdd) {
+    let hdd = media == MediaType::Hdd;
+    if usable.is_empty() && !all.is_empty() {
+        return if hdd {
+            Choice::Overwrite { frozen: false }
+        } else {
+            Choice::Blocked {
+                blocked: all
+                    .iter()
+                    .filter_map(|m| caps.transport_blocked(*m).map(|c| (*m, c)))
+                    .collect(),
+            }
+        };
+    }
+    match (usable.is_empty(), hdd) {
         (false, true) => Choice::Overwrite { frozen: true },
-        (false, false) => Choice::Frozen { blocked: all },
+        (false, false) => Choice::Frozen { blocked: usable },
         (true, true) => Choice::Overwrite { frozen: false },
         (true, false) => Choice::Unavailable,
     }
+}
+
+/// Méthodes à essayer après `first` si le transport la refuse (même ordre de préférence,
+/// sans les méthodes gelées ni celles déjà connues comme bloquées).
+pub fn next_methods(
+    caps: &Caps,
+    media: MediaType,
+    frozen: Frozen,
+    first: FwMethod,
+) -> Vec<FwMethod> {
+    candidates(caps, media)
+        .into_iter()
+        .skip_while(|m| *m != first)
+        .skip(1)
+        .filter(|m| !m.blocked_by(frozen) && caps.transport_blocked(*m).is_none())
+        .collect()
 }
 
 pub const FROZEN_GUIDE: &str = "\
@@ -259,10 +334,14 @@ pub fn explain(caps: &Caps, media: MediaType, choice: &Choice) -> Vec<String> {
                     yn(s.crypto),
                     yn(s.block),
                     yn(s.overwrite),
-                    match caps.ata_sanitize {
-                        Some(st) if st.frozen => " — GELÉ (Sanitize Freeze Lock)".to_string(),
-                        Some(_) => " — non gelé".to_string(),
-                        None => " — état non lu".to_string(),
+                    match (caps.ata_sanitize_blocked, caps.ata_sanitize) {
+                        (Some(c), _) => format!(
+                            " — BLOQUÉ (pilote ou adaptateur) : SANITIZE STATUS EXT refusé avant d'atteindre le disque (erreur Windows {c})"
+                        ),
+                        (None, Some(st)) if st.frozen =>
+                            " — GELÉ (Sanitize Freeze Lock)".to_string(),
+                        (None, Some(_)) => " — non gelé".to_string(),
+                        (None, None) => " — état non lu".to_string(),
                     }
                 )
             } else {
@@ -340,6 +419,14 @@ pub fn explain(caps: &Caps, media: MediaType, choice: &Choice) -> Vec<String> {
             blocked.iter().map(|m| m.label()).collect::<Vec<_>>().join(", ")
         ),
         Choice::Unavailable => format!("Aucune commande firmware d'effacement utilisable sur ce disque ({media})"),
+        Choice::Blocked { blocked } => format!(
+            "BLOQUÉ : {} — {FIRMWARE_BLOCKED_MSG}",
+            blocked
+                .iter()
+                .map(|(m, c)| blocked_note(*m, *c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     });
     out
 }
@@ -391,6 +478,9 @@ pub enum Decision {
 pub const SSD_NO_FIRMWARE: &str = "aucune commande firmware d'effacement utilisable ; l'écrasement ne garantit pas l'effacement d'un SSD (sur-provisionnement). \
      Options : --allow-fallback (TRIM + écrasement 1 passe, statut au mieux PARTIAL) ou --method overwrite (alias --force-overwrite-ssd)";
 
+/// Suite du message d'impasse (CLI) : comment obtenir l'écrasement.
+pub const BLOCKED_FALLBACK_HINT: &str = "Pour effacer par écrasement : relancer avec --allow-fallback (TRIM + écrasement 1 passe vérifiée, statut au mieux PARTIAL).";
+
 /// Décision PURE à partir de l'option, du repli autorisé, du support et du choix.
 pub fn decide(opt: MethodOpt, allow_fallback: bool, media: MediaType, choice: &Choice) -> Decision {
     if opt == MethodOpt::Overwrite {
@@ -420,6 +510,10 @@ pub fn decide(opt: MethodOpt, allow_fallback: bool, media: MediaType, choice: &C
             ),
         },
         Choice::Frozen { .. } => Decision::Frozen(FROZEN_GUIDE.into()),
+        Choice::Blocked { .. } if allow_fallback => Decision::Fallback,
+        Choice::Blocked { .. } => Decision::Refuse(format!(
+            "{FIRMWARE_BLOCKED_MSG} {BLOCKED_FALLBACK_HINT}"
+        )),
         Choice::Unavailable if allow_fallback => Decision::Fallback,
         Choice::Unavailable => Decision::Refuse(format!("disque de type {media} : {SSD_NO_FIRMWARE}")),
     }
@@ -588,6 +682,9 @@ pub struct Step {
     pub notes: Vec<String>,
     /// La commande a peut-être encore cours dans le disque (délai dépassé) : aucun repli.
     pub maybe_busy: bool,
+    /// Commande refusée par Windows, le pilote ou l'adaptateur AVANT d'atteindre le disque
+    /// (code Windows) : la méthode est indisponible, pas échouée.
+    pub blocked: Option<u32>,
     pub log: Vec<String>,
 }
 
@@ -655,12 +752,54 @@ fn remove_password(p: &mut dyn AtaPort, log: &mut Vec<String>) -> Result<(), Str
 /// Séquence ATA Security Erase : SET PASSWORD → ERASE PREPARE → ERASE UNIT. En cas d'échec
 /// après SET PASSWORD, DISABLE PASSWORD est TOUJOURS tenté ; s'il échoue, note critique.
 pub fn security_erase(p: &mut dyn AtaPort, enhanced: bool, timeout_secs: u32) -> Step {
+    match security_erase_begin(p) {
+        Ok(s) => security_erase_finish(p, enhanced, timeout_secs, s),
+        Err(s) => s,
+    }
+}
+
+/// Première étape : SECURITY SET PASSWORD. Ok = mot de passe posé (la suite DOIT être
+/// `security_erase_finish` ou le retrait du mot de passe) ; Err = étape terminée en échec
+/// (`blocked` renseigné si la commande n'a pas atteint le disque).
+pub fn security_erase_begin(p: &mut dyn AtaPort) -> Result<Step, Step> {
     let mut s = Step::default();
     match p.exec(&ata::security_set_password(ata::PASSWORD)) {
         Ok(_) => {}
         // Refus du disque : aucun mot de passe n'a été posé, rien à nettoyer.
         Err(e @ AtaError::Device { .. }) | Err(e @ AtaError::ReadOnly) => {
-            return s.fail(format!("SECURITY SET PASSWORD : {e}"))
+            return Err(s.fail(format!("SECURITY SET PASSWORD : {e}")))
+        }
+        // Refus par Windows, le pilote ou l'adaptateur : la commande n'a pas atteint le
+        // disque. Vérification de précaution par DISABLE PASSWORD : s'il réussit, un mot de
+        // passe avait bien été posé (ce n'était donc pas un refus du transport).
+        Err(e) if e.transport_refusal().is_some() => {
+            let code = e.transport_refusal().unwrap_or_default();
+            s = s.fail(format!("SECURITY SET PASSWORD : {e}"));
+            match p.exec(&ata::security_disable_password(ata::PASSWORD)) {
+                Ok(_) => s.log.push(
+                    "SECURITY DISABLE PASSWORD de précaution : OK (un mot de passe avait été posé)"
+                        .into(),
+                ),
+                Err(e2 @ AtaError::Device { .. }) => {
+                    s.log.push(format!(
+                        "SECURITY DISABLE PASSWORD de précaution refusé par le disque ({e2}) : aucun mot de passe posé"
+                    ));
+                    s.blocked = Some(code);
+                }
+                Err(e2) if e2.transport_refusal().is_some() => {
+                    s.log.push(format!(
+                        "SECURITY DISABLE PASSWORD de précaution également refusé avant le disque ({e2}) : rien n'a été envoyé"
+                    ));
+                    s.blocked = Some(code);
+                }
+                Err(e2) => {
+                    s.log.push(format!(
+                        "SECURITY DISABLE PASSWORD de précaution sans réponse : {e2}"
+                    ));
+                    s.critical.push(uncertain_password_note());
+                }
+            }
+            return Err(s);
         }
         // Erreur de transport : la commande a peut-être abouti → DISABLE de précaution.
         Err(e) => {
@@ -680,13 +819,33 @@ pub fn security_erase(p: &mut dyn AtaPort, enhanced: bool, timeout_secs: u32) ->
                     s.critical.push(uncertain_password_note());
                 }
             }
-            return s;
+            return Err(s);
         }
     }
     s.log.push(format!(
         "SECURITY SET PASSWORD (utilisateur \"{}\") : OK",
         ata::PASSWORD
     ));
+    Ok(s)
+}
+
+/// Retire le mot de passe posé par `security_erase_begin` quand l'effacement n'est pas lancé
+/// (marqueurs impossibles, interruption) ; note critique si le retrait échoue.
+pub fn security_erase_abandon(p: &mut dyn AtaPort, s: &mut Step) {
+    if let Err(e) = remove_password(p, &mut s.log) {
+        s.log
+            .push(format!("Nettoyage du mot de passe impossible : {e}"));
+        s.critical.push(locked_note());
+    }
+}
+
+/// Suite de la séquence après un SET PASSWORD réussi : ERASE PREPARE → ERASE UNIT.
+pub fn security_erase_finish(
+    p: &mut dyn AtaPort,
+    enhanced: bool,
+    timeout_secs: u32,
+    mut s: Step,
+) -> Step {
     let mode = if enhanced { "enhanced" } else { "normal" };
     let step = match p.exec(&ata::security_erase_prepare()) {
         Err(e) => Err((format!("SECURITY ERASE PREPARE : {e}"), false)),
@@ -781,6 +940,11 @@ pub fn ata_sanitize(
                 return s.fail(format!("{} (relance sans FAILURE MODE) : {e}", cmd.name()));
             }
             s.notes.push(note);
+        }
+        // Refus avant le disque (pilote, pont USB) : méthode indisponible, rien n'a été lancé.
+        Err(e) if e.transport_refusal().is_some() => {
+            s.blocked = e.transport_refusal();
+            return s.fail(format!("{} : {e}", cmd.name()));
         }
         Err(e) => return s.fail(format!("{} : {e}", cmd.name())),
     }
@@ -929,6 +1093,9 @@ pub fn nvme_sanitize(
 
 pub struct FwContext<'a> {
     pub method: FwMethod,
+    /// Méthodes suivantes, essayées UNIQUEMENT si le transport refuse la précédente avant
+    /// qu'elle atteigne le disque (voir `next_methods`).
+    pub then: Vec<FwMethod>,
     pub media: MediaType,
     pub caps: &'a Caps,
     pub seed: u64,
@@ -948,6 +1115,18 @@ pub struct FwRun {
     /// Délai dépassé sur une commande lancée : le disque est peut-être encore occupé,
     /// donc AUCUN repli automatique.
     pub maybe_busy: bool,
+    /// Méthodes refusées par Windows, le pilote ou l'adaptateur avant d'atteindre le disque.
+    pub blocked: Vec<(FwMethod, u32)>,
+    /// Marqueurs écrits sur le disque.
+    pub markers_written: bool,
+}
+
+impl FwRun {
+    /// Toutes les méthodes essayées ont été refusées par le transport : AUCUNE commande
+    /// d'effacement n'a atteint le disque (impasse à signaler, repli à proposer).
+    pub fn all_blocked(&self) -> bool {
+        !self.attempted && !self.blocked.is_empty()
+    }
 }
 
 impl FwRun {
@@ -965,52 +1144,77 @@ impl FwRun {
     }
 }
 
-/// Marqueurs → commande firmware → relecture des marqueurs.
-pub fn run_firmware(
+/// Issue d'une tentative de méthode firmware.
+enum Attempt {
+    /// Refusée par Windows, le pilote ou l'adaptateur avant d'atteindre le disque.
+    Blocked(Step, u32),
+    /// Marqueurs impossibles à poser : commande d'effacement NON lancée.
+    NotLaunched(Step, String),
+    /// Commande envoyée au disque (réussie ou non).
+    Sent(Step),
+}
+
+/// Écrit les marqueurs une seule fois, juste avant la première commande qui atteint le disque.
+fn ensure_markers(
     d: &mut dyn FirmwareDisk,
     ctx: &FwContext,
-    sleep: &mut dyn FnMut(Duration),
+    positions: &[u64],
+    run: &mut FwRun,
+    planted: &mut bool,
     progress: &mut dyn FnMut(&str),
-) -> FwRun {
-    let m = ctx.method;
-    let mut run = FwRun {
-        report: FirmwareReport {
-            label: m.label().to_string(),
-            kind: m.kind(),
-            command_ok: false,
-            markers: None,
-            fallback: None,
-            critical: Vec::new(),
-        },
-        notes: Vec::new(),
-        log: Vec::new(),
-        attempted: false,
-        maybe_busy: false,
-    };
-    let size = d.size();
-    let positions = plan_markers(size, d.sector_size(), ctx.seed, ctx.markers);
-    progress(&format!("Écriture de {} marqueurs…", positions.len()));
-    if let Err(e) = plant_markers(d, &positions, ctx.seed, ctx.cancel) {
-        run.notes.push(format!(
-            "Marqueurs non posés ({e}) : {m} NON lancée (vérification impossible)"
-        ));
-        run.log.push(format!("Marqueurs : {e}"));
-        return run;
+) -> Result<(), String> {
+    if *planted {
+        return Ok(());
     }
+    progress(&format!("Écriture de {} marqueurs…", positions.len()));
+    // Une écriture a pu avoir lieu même si la pose échoue en cours de route.
+    run.markers_written = true;
+    plant_markers(d, positions, ctx.seed, ctx.cancel)?;
     run.log.push(format!(
         "{} marqueurs écrits, synchronisés et relus",
         positions.len()
     ));
+    *planted = true;
+    Ok(())
+}
 
-    run.attempted = true;
-    progress(&format!("Lancement de {m}…"));
-    let step = match m {
+/// Une méthode : pré-contrôle sans effet si possible, marqueurs, puis commande.
+#[allow(clippy::too_many_arguments)]
+fn attempt(
+    d: &mut dyn FirmwareDisk,
+    ctx: &FwContext,
+    m: FwMethod,
+    positions: &[u64],
+    run: &mut FwRun,
+    planted: &mut bool,
+    sleep: &mut dyn FnMut(Duration),
+    progress: &mut dyn FnMut(&str),
+) -> Attempt {
+    let size = d.size();
+    let no_ata = || Attempt::Sent(Step::default().fail("port ATA indisponible".into()));
+    match m {
         FwMethod::AtaSanitizeCrypto
         | FwMethod::AtaSanitizeBlock
-        | FwMethod::AtaSanitizeOverwrite => match d.ata() {
-            Some(p) => ata_sanitize(p, m, sanitize_max_wait(m, size), ctx.poll, sleep, progress),
-            None => Step::default().fail("port ATA indisponible".into()),
-        },
+        | FwMethod::AtaSanitizeOverwrite => {
+            let Some(p) = d.ata() else { return no_ata() };
+            // Pré-contrôle sans effet : SANITIZE STATUS EXT utilise le même opcode (B4h).
+            if let Err(e) = ata::read_sanitize_status(p) {
+                if let Some(code) = e.transport_refusal() {
+                    let mut s = Step::default().fail(format!("SANITIZE STATUS EXT : {e}"));
+                    s.blocked = Some(code);
+                    return Attempt::Blocked(s, code);
+                }
+            }
+            if let Err(e) = ensure_markers(d, ctx, positions, run, planted, progress) {
+                return Attempt::NotLaunched(Step::default(), e);
+            }
+            let Some(p) = d.ata() else { return no_ata() };
+            let s = ata_sanitize(p, m, sanitize_max_wait(m, size), ctx.poll, sleep, progress);
+            match s.blocked {
+                Some(code) => Attempt::Blocked(s, code),
+                None => Attempt::Sent(s),
+            }
+        }
         FwMethod::AtaSecurityEraseEnhanced | FwMethod::AtaSecurityEraseNormal => {
             let enhanced = m == FwMethod::AtaSecurityEraseEnhanced;
             let announced = ctx.caps.ata.as_ref().and_then(|i| {
@@ -1021,11 +1225,151 @@ pub fn run_firmware(
                 }
             });
             let t = security_timeout_secs(announced, ctx.media, size);
-            match d.ata() {
-                Some(p) => security_erase(p, enhanced, t),
-                None => Step::default().fail("port ATA indisponible".into()),
+            let Some(p) = d.ata() else { return no_ata() };
+            // SET PASSWORD d'abord : s'il est refusé avant le disque, rien n'est écrit.
+            let s = match security_erase_begin(p) {
+                Ok(s) => s,
+                Err(s) => {
+                    return match s.blocked {
+                        Some(code) => Attempt::Blocked(s, code),
+                        None => Attempt::Sent(s),
+                    }
+                }
+            };
+            // Mot de passe posé (disque non verrouillé tant qu'il reste alimenté) : marqueurs,
+            // puis ERASE PREPARE immédiatement suivi d'ERASE UNIT.
+            if let Err(e) = ensure_markers(d, ctx, positions, run, planted, progress) {
+                let mut s = s;
+                match d.ata() {
+                    Some(p) => security_erase_abandon(p, &mut s),
+                    None => s.critical.push(locked_note()),
+                }
+                return Attempt::NotLaunched(s, e);
+            }
+            let Some(p) = d.ata() else { return no_ata() };
+            Attempt::Sent(security_erase_finish(p, enhanced, t, s))
+        }
+        FwMethod::NvmeSanitizeCrypto
+        | FwMethod::NvmeSanitizeBlock
+        | FwMethod::NvmeFormatCrypto
+        | FwMethod::NvmeFormatUserData => {
+            if let Err(e) = ensure_markers(d, ctx, positions, run, planted, progress) {
+                return Attempt::NotLaunched(Step::default(), e);
+            }
+            Attempt::Sent(nvme_step(d, ctx, m, size, sleep, progress))
+        }
+    }
+}
+
+/// Marqueurs → commande firmware → relecture des marqueurs. Si Windows, le pilote ou
+/// l'adaptateur refuse une méthode AVANT qu'elle atteigne le disque, la suivante
+/// (`ctx.then`) est essayée ; une commande envoyée puis échouée n'est jamais suivie d'une
+/// autre. Les marqueurs ne sont écrits qu'une fois, juste avant la première commande qui
+/// passe (pré-contrôle SANITIZE STATUS EXT, SET PASSWORD).
+pub fn run_firmware(
+    d: &mut dyn FirmwareDisk,
+    ctx: &FwContext,
+    sleep: &mut dyn FnMut(Duration),
+    progress: &mut dyn FnMut(&str),
+) -> FwRun {
+    let mut run = FwRun {
+        report: FirmwareReport {
+            label: ctx.method.label().to_string(),
+            kind: ctx.method.kind(),
+            command_ok: false,
+            markers: None,
+            fallback: None,
+            critical: Vec::new(),
+        },
+        notes: Vec::new(),
+        log: Vec::new(),
+        attempted: false,
+        maybe_busy: false,
+        blocked: Vec::new(),
+        markers_written: false,
+    };
+    let positions = plan_markers(d.size(), d.sector_size(), ctx.seed, ctx.markers);
+    let mut planted = false;
+    let mut sent: Option<(FwMethod, Step)> = None;
+    for m in std::iter::once(ctx.method).chain(ctx.then.iter().copied()) {
+        if let Some(code) = ctx.caps.transport_blocked(m) {
+            run.log
+                .push(format!("{m} : non tentée ({})", blocked_note(m, code)));
+            run.blocked.push((m, code));
+            continue;
+        }
+        progress(&format!("Lancement de {m}…"));
+        match attempt(
+            d,
+            ctx,
+            m,
+            &positions,
+            &mut run,
+            &mut planted,
+            sleep,
+            progress,
+        ) {
+            Attempt::Blocked(s, code) => {
+                run.log.extend(s.log);
+                run.log
+                    .push(format!("{} : méthode suivante", blocked_note(m, code)));
+                run.blocked.push((m, code));
+            }
+            Attempt::NotLaunched(s, e) => {
+                run.report.label = m.label().to_string();
+                run.report.kind = m.kind();
+                run.log.extend(s.log);
+                run.report.critical = s.critical;
+                push_blocked_notes(&mut run);
+                run.notes.push(format!(
+                    "Marqueurs non posés ({e}) : {m} NON lancée (vérification impossible)"
+                ));
+                run.log.push(format!("Marqueurs : {e}"));
+                return run;
+            }
+            Attempt::Sent(s) => {
+                sent = Some((m, s));
+                break;
             }
         }
+    }
+    push_blocked_notes(&mut run);
+    let Some((m, step)) = sent else {
+        // Rien n'a atteint le disque : méthode indisponible sur cette connexion.
+        run.report.label = crate::report::BLOCKED_LABEL.to_string();
+        run.notes.push(if run.markers_written {
+            "Aucune commande d'effacement n'a atteint le disque (seuls les marqueurs de vérification ont été écrits)".to_string()
+        } else {
+            "Aucune commande n'a atteint le disque : rien n'a été écrit".to_string()
+        });
+        return run;
+    };
+    run.report.label = m.label().to_string();
+    run.report.kind = m.kind();
+    run.attempted = true;
+    finish_step(d, ctx, &positions, run, step, progress)
+}
+
+/// Une note par famille bloquée (Sanitize Crypto et Block partagent l'opcode B4h).
+fn push_blocked_notes(run: &mut FwRun) {
+    for (b, c) in &run.blocked {
+        let n = blocked_note(*b, *c);
+        if !run.notes.contains(&n) {
+            run.notes.push(n);
+        }
+    }
+}
+
+/// Commandes NVMe (Sanitize, Format NVM).
+fn nvme_step(
+    d: &mut dyn FirmwareDisk,
+    ctx: &FwContext,
+    m: FwMethod,
+    size: u64,
+    sleep: &mut dyn FnMut(Duration),
+    progress: &mut dyn FnMut(&str),
+) -> Step {
+    match m {
         FwMethod::NvmeSanitizeCrypto | FwMethod::NvmeSanitizeBlock => match d.nvme() {
             Some(p) => nvme_sanitize(p, m, sanitize_max_wait(m, size), ctx.poll, sleep, progress),
             None => Step::default().fail("port NVMe indisponible".into()),
@@ -1063,7 +1407,19 @@ pub fn run_firmware(
                 (_, None) => Step::default().fail("port NVMe indisponible".into()),
             }
         }
-    };
+        other => Step::default().fail(format!("{other} n'est pas une commande NVMe")),
+    }
+}
+
+/// Résultat de la commande envoyée, puis relecture des marqueurs si elle a réussi.
+fn finish_step(
+    d: &mut dyn FirmwareDisk,
+    ctx: &FwContext,
+    positions: &[u64],
+    mut run: FwRun,
+    step: Step,
+    progress: &mut dyn FnMut(&str),
+) -> FwRun {
     run.log.extend(step.log.iter().cloned());
     run.report.critical = step.critical.clone();
     run.maybe_busy = step.maybe_busy;
@@ -1076,7 +1432,7 @@ pub fn run_firmware(
     }
     run.report.command_ok = true;
     progress("Relecture des marqueurs…");
-    let check = check_markers(d, &positions, ctx.seed);
+    let check = check_markers(d, positions, ctx.seed);
     run.notes.push(format!("Vérification : {}", check.label()));
     run.report.markers = Some(check);
     run
@@ -1159,7 +1515,17 @@ pub fn probe_ata(p: &mut dyn AtaPort) -> Probe {
     if id.sanitize.supported {
         match ata::read_sanitize_status(p) {
             Ok(s) => pr.caps.ata_sanitize = Some(s),
-            Err(e) => pr.errors.push(format!("SANITIZE STATUS EXT : {e}")),
+            Err(e) => {
+                // Refus avant le disque : l'opcode B4h est filtré, Sanitize ne passera pas.
+                pr.caps.ata_sanitize_blocked = e.transport_refusal();
+                pr.errors.push(if e.transport_refusal().is_some() {
+                    format!(
+                        "SANITIZE STATUS EXT : {e} — ATA Sanitize bloqué (pilote ou adaptateur)"
+                    )
+                } else {
+                    format!("SANITIZE STATUS EXT : {e}")
+                });
+            }
         }
     }
     let (mut data, mut thr, mut health) = (None, None, None);
@@ -1288,6 +1654,9 @@ pub(crate) mod tests {
         pub lock_on_erase_fail: bool,
         /// Commandes exécutées puis signalées en erreur de transport (délai Windows 121).
         pub transport: Vec<u8>,
+        /// Commandes refusées par le pilote/l'adaptateur AVANT le disque (opcode, code
+        /// Windows) : jamais exécutées ni journalisées.
+        pub refuse: Vec<(u8, u32)>,
         /// Sanitize refusée (ABRT) si le bit FAILURE MODE est présent.
         pub abort_failure_mode: bool,
         pub san_frozen: bool,
@@ -1314,6 +1683,7 @@ pub(crate) mod tests {
                 fail: vec![],
                 lock_on_erase_fail: false,
                 transport: vec![],
+                refuse: vec![],
                 abort_failure_mode: false,
                 san_frozen: false,
                 san_left: None,
@@ -1341,6 +1711,9 @@ pub(crate) mod tests {
 
     impl AtaPort for FakeAta {
         fn exec(&mut self, c: &AtaCmd) -> Result<AtaResult, AtaError> {
+            if let Some((_, code)) = self.refuse.iter().find(|(op, _)| *op == c.command) {
+                return Err(AtaError::Windows(*code));
+            }
             self.log.push(c.name());
             let r = self.inner(c);
             if self.transport.contains(&c.command) {
@@ -1633,6 +2006,7 @@ pub(crate) mod tests {
     fn ctx<'a>(m: FwMethod, caps: &'a Caps, cancel: &'a AtomicBool) -> FwContext<'a> {
         FwContext {
             method: m,
+            then: Vec::new(),
             media: MediaType::Ssd,
             caps,
             seed: 7,
@@ -2527,6 +2901,235 @@ pub(crate) mod tests {
             Some("NVMe FORMAT NVM (SES=1) refusé : erreur Windows 1".into());
         let r = run(&mut d, FwMethod::NvmeFormatUserData, &caps);
         assert!(r.notes.iter().any(|n| n.contains("erreur Windows 1")));
+    }
+
+    // ----- Refus du transport (pilote, adaptateur USB) -----
+
+    /// Méthode choisie + méthodes suivantes, comme job::run_firmware_erase.
+    fn run_chain(d: &mut FakeDrive, caps: &Caps) -> FwRun {
+        let cancel = AtomicBool::new(false);
+        let first = match choose(caps, MediaType::Ssd, caps.frozen()) {
+            Choice::Firmware(m) => m,
+            other => panic!("{other:?}"),
+        };
+        let mut c = ctx(first, caps, &cancel);
+        c.then = next_methods(caps, MediaType::Ssd, caps.frozen(), first);
+        run_firmware(d, &c, &mut |_| {}, &mut |_| {})
+    }
+
+    fn record(r: &FwRun) -> crate::report::EraseRecord {
+        let o = firmware_outcome(MB8 as u64, r, Duration::ZERO);
+        let mut disk = crate::report::tests::sample_disk();
+        disk.size_bytes = MB8 as u64;
+        disk.media = MediaType::Ssd;
+        let plan = Plan::dod_default(1);
+        crate::report::build_record(crate::report::RecordInput {
+            disk: &disk,
+            plan: &plan,
+            outcome: &o,
+            kind: crate::report::MethodKind::Firmware,
+            degraded: false,
+            org: Default::default(),
+            technician: Default::default(),
+            customer: Default::default(),
+            tag: String::new(),
+            start: crate::clock::DateTime::now(),
+            end: crate::clock::DateTime::now(),
+            notes: r.notes.clone(),
+            smart: None,
+            test_target: false,
+            ssd_overwrite: false,
+            hidden: Hidden::NotApplicable("test".into()),
+            real_size: None,
+            firmware: Some(r.report.clone()),
+        })
+    }
+
+    #[test]
+    fn transport_refusal_codes() {
+        assert_eq!(AtaError::Windows(50).transport_refusal(), Some(50));
+        assert_eq!(AtaError::Windows(1).transport_refusal(), Some(1));
+        assert_eq!(AtaError::Windows(87).transport_refusal(), Some(87));
+        assert_eq!(AtaError::Windows(121).transport_refusal(), None);
+        assert_eq!(AtaError::Windows(5).transport_refusal(), None);
+        assert_eq!(ABRT.transport_refusal(), None);
+    }
+
+    #[test]
+    fn sanitize_refused_by_transport_then_security_erase_purge() {
+        let mut d = FakeDrive::ata(MB8);
+        // Sonde sans refus : Sanitize retenu, puis refusé au moment de l'effacement.
+        let caps = probe_ata(d.ata.as_mut().unwrap()).caps;
+        assert_eq!(caps.ata_sanitize_blocked, None);
+        let a = d.ata.as_mut().unwrap();
+        a.refuse = vec![(ata::CMD_SANITIZE, 50)];
+        a.log.clear();
+        let r = run_chain(&mut d, &caps);
+        assert!(r.attempted && r.report.command_ok, "{:?}", r.log);
+        assert!(!r.all_blocked());
+        assert_eq!(r.report.label, "ATA Security Erase Enhanced");
+        assert_eq!(
+            r.blocked,
+            vec![
+                (FwMethod::AtaSanitizeCrypto, 50),
+                (FwMethod::AtaSanitizeBlock, 50)
+            ]
+        );
+        let note = "ATA Sanitize bloqué par le pilote ou l'adaptateur (erreur Windows 50)";
+        assert_eq!(
+            r.notes.iter().filter(|n| *n == note).count(),
+            1,
+            "{:?}",
+            r.notes
+        );
+        assert!(r.report.markers.as_ref().unwrap().ok());
+        assert_eq!(
+            crate::report::firmware_verdict(&r.report, 0, false),
+            (crate::report::Status::Erased, "Purge")
+        );
+        assert!(!d
+            .ata
+            .as_ref()
+            .unwrap()
+            .log
+            .iter()
+            .any(|l| l.starts_with("SANITIZE")));
+    }
+
+    #[test]
+    fn all_firmware_refused_by_transport_writes_nothing_and_offers_fallback() {
+        let mut d = FakeDrive::ata(MB8);
+        let caps = probe_ata(d.ata.as_mut().unwrap()).caps;
+        d.mem.data.fill(0xAB);
+        d.ata.as_mut().unwrap().refuse =
+            vec![(ata::CMD_SANITIZE, 50), (ata::CMD_SEC_SET_PASSWORD, 1)];
+        let r = run_chain(&mut d, &caps);
+        assert!(r.all_blocked() && r.failed() && !r.attempted, "{:?}", r.log);
+        assert_eq!(r.blocked.len(), 4);
+        assert_eq!(r.report.label, crate::report::BLOCKED_LABEL);
+        assert!(r.report.markers.is_none() && !r.markers_written);
+        assert!(r.report.critical.is_empty());
+        assert!(d.mem.data.iter().all(|&b| b == 0xAB), "aucune écriture");
+        assert!(!d.ata.as_ref().unwrap().enabled, "aucun mot de passe posé");
+        // Repli possible seulement si l'opérateur l'autorise.
+        assert!(r.fallback_allowed(true) && !r.fallback_allowed(false));
+        assert!(r.notes.iter().any(|n| {
+            n
+            == "ATA Security Erase Enhanced bloqué par le pilote ou l'adaptateur (erreur Windows 1)"
+        }));
+        let rec = record(&r);
+        assert_eq!(rec.status, crate::report::Status::Failed);
+        assert_eq!(rec.bytes_erased, 0);
+        assert!(
+            rec.notes[0]
+                .starts_with("ÉCHEC : Aucune méthode firmware utilisable sur cette connexion"),
+            "{:?}",
+            rec.notes
+        );
+    }
+
+    #[test]
+    fn abort_after_sending_is_not_a_refusal_and_does_not_switch_method() {
+        // ABRT : la commande a atteint le disque.
+        let mut d = FakeDrive::ata(MB8);
+        let caps = probe_ata(d.ata.as_mut().unwrap()).caps;
+        d.ata.as_mut().unwrap().fail = vec![ata::CMD_SANITIZE];
+        let r = run_chain(&mut d, &caps);
+        assert!(r.attempted && r.failed() && !r.all_blocked());
+        assert!(r.blocked.is_empty());
+        assert_eq!(r.report.label, "ATA Sanitize Crypto Scramble");
+        let a = d.ata.as_ref().unwrap();
+        assert!(
+            !a.log.iter().any(|l| l.starts_with("SECURITY")),
+            "{:?}",
+            a.log
+        );
+        assert!(!a.enabled);
+        // Erreur de transport après envoi (délai, erreur Windows 121) : pas de changement de méthode.
+        let mut d = FakeDrive::ata(MB8);
+        d.ata.as_mut().unwrap().transport = vec![ata::CMD_SANITIZE];
+        let r = run_chain(&mut d, &caps);
+        assert!(r.attempted && r.failed() && r.blocked.is_empty());
+        assert!(!d
+            .ata
+            .as_ref()
+            .unwrap()
+            .log
+            .iter()
+            .any(|l| l.starts_with("SECURITY")));
+    }
+
+    #[test]
+    fn probe_marks_sanitize_blocked_and_recommends_next_method() {
+        let mut a = FakeAta::new();
+        a.refuse = vec![(ata::CMD_SANITIZE, 50)];
+        let p = probe_ata(&mut a);
+        assert_eq!(p.caps.ata_sanitize_blocked, Some(50));
+        assert!(p.caps.ata_sanitize.is_none());
+        assert!(p
+            .errors
+            .iter()
+            .any(|e| e.contains("erreur Windows 50") && e.contains("bloqué")));
+        let c = choose(&p.caps, MediaType::Ssd, p.caps.frozen());
+        assert_eq!(c, Choice::Firmware(FwMethod::AtaSecurityEraseEnhanced));
+        let ex = explain(&p.caps, MediaType::Ssd, &c).join("\n");
+        assert!(ex.contains("BLOQUÉ (pilote ou adaptateur)"), "{ex}");
+        assert!(ex.contains("erreur Windows 50"));
+        assert!(
+            next_methods(
+                &p.caps,
+                MediaType::Ssd,
+                Frozen::default(),
+                FwMethod::AtaSecurityEraseEnhanced
+            ) == vec![FwMethod::AtaSecurityEraseNormal]
+        );
+        // Une autre erreur (délai) n'est pas un blocage.
+        let mut a = FakeAta::new();
+        a.transport = vec![ata::CMD_SANITIZE];
+        assert_eq!(probe_ata(&mut a).caps.ata_sanitize_blocked, None);
+    }
+
+    #[test]
+    fn sanitize_only_and_blocked_gives_dead_end_message_and_fallback() {
+        let mut caps = ata_caps(
+            SanitizeCaps {
+                supported: true,
+                crypto: true,
+                block: true,
+                ..Default::default()
+            },
+            SecurityState::default(),
+        );
+        caps.ata_sanitize_blocked = Some(50);
+        let c = choose(&caps, MediaType::Ssd, Frozen::default());
+        assert_eq!(
+            c,
+            Choice::Blocked {
+                blocked: vec![
+                    (FwMethod::AtaSanitizeCrypto, 50),
+                    (FwMethod::AtaSanitizeBlock, 50)
+                ]
+            }
+        );
+        match decide(MethodOpt::Auto, false, MediaType::Ssd, &c) {
+            Decision::Refuse(e) => {
+                assert!(e.contains(FIRMWARE_BLOCKED_MSG) && e.contains("--allow-fallback"))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            decide(MethodOpt::Auto, true, MediaType::Ssd, &c),
+            Decision::Fallback
+        );
+        assert!(explain(&caps, MediaType::Ssd, &c)
+            .last()
+            .unwrap()
+            .contains("BLOQUÉ"));
+        // HDD : écrasement DoD.
+        assert_eq!(
+            choose(&caps, MediaType::Hdd, Frozen::default()),
+            Choice::Overwrite { frozen: false }
+        );
     }
 
     // ----- Repli -----

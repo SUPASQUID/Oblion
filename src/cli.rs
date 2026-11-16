@@ -410,8 +410,40 @@ fn erase_disk(args: &[String], n: &str, cfg: &Config, paths: &Paths) -> Result<i
         &o,
         &mut |_, p: &Probe, media| print_probe(p, media, false),
         None,
-    )?;
-    Ok(done.exit_code())
+    );
+    // Commandes firmware toutes bloquées par le transport : message et commande à relancer.
+    let blocked = match &done {
+        Ok(job::Done::Finished(f)) => f.firmware_blocked,
+        Err(e) => e.message().contains(erase_ssd::FIRMWARE_BLOCKED_MSG),
+        _ => false,
+    };
+    if blocked {
+        eprintln!();
+        eprintln!("{}", erase_ssd::FIRMWARE_BLOCKED_MSG);
+        eprintln!("Pour effacer par écrasement (NIST Clear : TRIM + 1 passe aléatoire vérifiée, statut au mieux PARTIAL), relancer :");
+        eprintln!("  {}", relaunch_with_fallback(&exe_name(), args));
+    }
+    Ok(done?.exit_code())
+}
+
+/// Commande à relancer avec `--allow-fallback` (arguments d'origine, guillemets si besoin).
+pub fn relaunch_with_fallback(exe: &str, args: &[String]) -> String {
+    let quote = |a: &str| {
+        if a.is_empty() || a.contains(char::is_whitespace) {
+            format!("\"{a}\"")
+        } else {
+            a.to_string()
+        }
+    };
+    std::iter::once(exe.to_string())
+        .chain(
+            args.iter()
+                .filter(|a| a.as_str() != "--allow-fallback")
+                .map(|a| quote(a)),
+        )
+        .chain(std::iter::once("--allow-fallback".to_string()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn erase_file(args: &[String], file: &str, cfg: &Config, paths: &Paths) -> Result<i32, JobError> {
@@ -724,6 +756,21 @@ mod tests {
             &test_paths()
         )
         .is_err());
+    }
+
+    #[test]
+    fn relaunch_command_adds_allow_fallback_once() {
+        assert_eq!(
+            relaunch_with_fallback(
+                "oblion-cli",
+                &a(&["--erase", "2", "--confirm", "AB12", "--tag", "PC salle 3"])
+            ),
+            "oblion-cli --erase 2 --confirm AB12 --tag \"PC salle 3\" --allow-fallback"
+        );
+        assert_eq!(
+            relaunch_with_fallback("oblion", &a(&["--erase", "1", "--allow-fallback"])),
+            "oblion --erase 1 --allow-fallback"
+        );
     }
 
     #[test]

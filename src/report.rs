@@ -297,6 +297,10 @@ pub const NOTE_SANITIZE_HYPOTHESIS: &str = "Hypothèse : Sanitize couvre tout le
 /// Libellé du « rapport firmware » quand aucune commande n'était utilisable (repli direct).
 pub const NO_FIRMWARE_LABEL: &str = "aucune commande firmware utilisable";
 
+/// Libellé du « rapport firmware » quand toutes les méthodes essayées ont été refusées par
+/// Windows, le pilote ou l'adaptateur (aucune commande n'a atteint le disque).
+pub const BLOCKED_LABEL: &str = "Aucune méthode firmware utilisable sur cette connexion";
+
 /// Note (en tête) et bandeau des certificats du mode démonstration.
 pub const NOTE_DEMO: &str = "TEST / DÉMO — aucun disque réel (disque simulé en mémoire)";
 
@@ -398,6 +402,8 @@ pub fn build_record(i: RecordInput) -> EraseRecord {
     if let Some((fw, _)) = fallback {
         notes.push(if fw.label == NO_FIRMWARE_LABEL {
             "Aucune commande d'effacement firmware utilisable : repli sur TRIM + écrasement (NIST Clear), statut au mieux PARTIAL".to_string()
+        } else if fw.label == BLOCKED_LABEL {
+            "Commandes d'effacement firmware bloquées par le pilote ou l'adaptateur : repli sur TRIM + écrasement (NIST Clear), statut au mieux PARTIAL".to_string()
         } else {
             format!(
                 "REPLI après « {} » : effacement par écrasement (NIST Clear), statut au mieux PARTIAL",
@@ -434,7 +440,9 @@ pub fn build_record(i: RecordInput) -> EraseRecord {
         }
     }
     if let Some(fw) = fw_only {
-        if !fw.command_ok {
+        if !fw.command_ok && fw.label == BLOCKED_LABEL {
+            notes.push(format!("ÉCHEC : {BLOCKED_LABEL}, aucun repli effectué"));
+        } else if !fw.command_ok {
             notes.push(format!(
                 "ÉCHEC : {} non aboutie, aucun repli effectué",
                 fw.label

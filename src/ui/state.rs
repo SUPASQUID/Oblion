@@ -99,7 +99,7 @@ pub fn method_options(disk: &DiskInfo, probe: &Probe, plan: &Plan) -> Vec<Method
 
 /// Avertissements de l'écran Configuration.
 pub fn config_warnings(opt: &MethodOption, probe: &Probe) -> Vec<String> {
-    let mut w = Vec::new();
+    let mut w: Vec<String> = blocked_warning(probe).into_iter().collect();
     match &opt.analysis.decision {
         Decision::Frozen(guide) => w.push(guide.clone()),
         Decision::Overwrite { ssd, note } => {
@@ -134,6 +134,43 @@ pub fn config_warnings(opt: &MethodOption, probe: &Probe) -> Vec<String> {
         w.push(format!("Lecture : {e}"));
     }
     w
+}
+
+/// Option « Effacer par écrasement (NIST Clear) » proposée par l'écran Résultat : seulement
+/// si toutes les méthodes firmware ont été bloquées par le transport (rien n'a atteint le
+/// disque). Préfère le repli Clear (TRIM + 1 passe vérifiée), sinon l'écrasement forcé.
+pub fn clear_option(firmware_blocked: bool, options: &[MethodOption]) -> Option<usize> {
+    if !firmware_blocked {
+        return None;
+    }
+    let fallback = |o: &MethodOption| {
+        o.runnable()
+            && match o.analysis.decision {
+                Decision::Fallback => true,
+                Decision::Firmware(_) => o.analysis.allow_fallback,
+                _ => false,
+            }
+    };
+    options.iter().position(fallback).or_else(|| {
+        options
+            .iter()
+            .position(|o| o.runnable() && matches!(o.analysis.decision, Decision::Overwrite { .. }))
+    })
+}
+
+/// Bandeau de l'écran Configuration quand on y revient par « Effacer par écrasement ».
+pub const CLEAR_HINT: &str = "Tentative précédente : commandes firmware bloquées par le pilote ou l'adaptateur. \
+     Méthode de repli présélectionnée : si les commandes sont de nouveau bloquées, le disque est effacé par écrasement \
+     (TRIM + 1 passe aléatoire vérifiée, NIST Clear, statut au mieux PARTIAL). La confirmation par code reste obligatoire.";
+
+/// Avertissement « Sanitize bloqué » pour l'écran Configuration (raison du choix).
+pub fn blocked_warning(probe: &Probe) -> Option<String> {
+    probe.caps.ata_sanitize_blocked.map(|c| {
+        format!(
+            "{} : SANITIZE STATUS EXT refusé avant d'atteindre le disque, la méthode suivante est retenue.",
+            crate::erase_ssd::blocked_note(crate::erase_ssd::FwMethod::AtaSanitizeCrypto, c)
+        )
+    })
 }
 
 /// « Continuer » de l'écran Configuration.
@@ -391,6 +428,48 @@ mod tests {
         assert!(o.iter().all(MethodOption::runnable));
         assert!(o.iter().any(|x| x.analysis.decision == Decision::Fallback));
         assert!(!o[0].recommended || o[0].runnable());
+    }
+
+    #[test]
+    fn blocked_sanitize_is_explained_and_next_method_recommended() {
+        let disks = demo_disks();
+        let mut p = demo_probe(&disks[3]);
+        p.caps.ata_sanitize = None;
+        p.caps.ata_sanitize_blocked = Some(50);
+        let o = method_options(&disks[3], &p, &Plan::dod_default(1));
+        assert!(o[0].recommended);
+        match &o[0].analysis.decision {
+            Decision::Firmware(m) => assert_ne!(m.family(), "ATA Sanitize"),
+            Decision::Fallback => {}
+            other => panic!("{other:?}"),
+        }
+        let w = config_warnings(&o[0], &p);
+        assert!(
+            w[0].contains("ATA Sanitize bloqué par le pilote ou l'adaptateur (erreur Windows 50)"),
+            "{w:?}"
+        );
+        assert!(o[0].reason.contains("bloqué"), "{}", o[0].reason);
+    }
+
+    #[test]
+    fn clear_button_only_when_all_firmware_was_blocked() {
+        let disks = demo_disks();
+        let plan = Plan::dod_default(1);
+        let o = method_options(&disks[3], &demo_probe(&disks[3]), &plan);
+        // Échec ordinaire (ou succès) : aucun bouton.
+        assert_eq!(clear_option(false, &o), None);
+        // Tout bloqué : l'option de repli est présélectionnée.
+        let i = clear_option(true, &o).expect("option de repli");
+        assert!(o[i].runnable());
+        assert!(o[i].analysis.allow_fallback || o[i].analysis.decision == Decision::Fallback);
+        // Sans option de repli : l'écrasement forcé.
+        let only: Vec<MethodOption> = o
+            .iter()
+            .filter(|x| matches!(x.analysis.decision, Decision::Overwrite { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(clear_option(true, &only), Some(0));
+        assert_eq!(clear_option(true, &[]), None);
     }
 
     #[test]

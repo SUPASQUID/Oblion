@@ -7,6 +7,31 @@ utilise le [versionnage sémantique](https://semver.org/lang/fr/).
 
 ## [Non publié]
 
+## [0.1.1] - 2026-11-16
+
+### Corrigé
+
+- **Commandes firmware bloquées par le pilote ou l'adaptateur** (premier retour sur
+  matériel réel : SSD SATA, ATA Sanitize refusé avec l'erreur Windows 50) :
+  - un refus de Windows, du pilote ou de l'adaptateur **avant** le disque (erreurs
+    Windows 1, 50, 87) rend la méthode « indisponible » au lieu de « échouée » : Oblion
+    passe à la suivante dans l'ordre de préférence (SSD SATA : Security Erase Enhanced,
+    puis Normal) ; chaque méthode bloquée et son code figurent sur le certificat ;
+  - une commande envoyée au disque puis échouée (ABRT, délai) n'est toujours suivie
+    d'aucune autre méthode ;
+  - la sonde en lecture seule (`--info`, écran Configuration, dry-run) marque ATA
+    Sanitize « bloqué (pilote ou adaptateur) » si SANITIZE STATUS EXT est refusé, et
+    recommande la méthode suivante ;
+  - les marqueurs de vérification ne sont écrits qu'une fois qu'une commande atteint le
+    disque : si tout est bloqué, rien n'est écrit ;
+  - plus de cul-de-sac : si toutes les méthodes firmware sont bloquées, le certificat
+    reste FAILED (« Aucune méthode firmware utilisable sur cette connexion »), l'écran
+    Résultat explique la cause (adaptateur USB, pilote RAID/RST, mode non-AHCI) et
+    propose « Effacer par écrasement (NIST Clear) », qui revient à l'écran
+    Configuration avec le repli présélectionné (confirmation par code toujours exigée) ;
+    la CLI affiche le même message et la commande exacte à relancer avec
+    `--allow-fallback`.
+
 ## [0.1.0] - 2026-11-13
 
 Première version publique. Effacement validé sur disque virtuel (VHD) ; lecture NVMe
@@ -62,5 +87,6 @@ du matériel physique.
   un disque sans n° de série.
 - Débit provisoire affiché pendant la progression au lieu de 0,0 MB/s.
 
-[Non publié]: https://github.com/SUPASQUID/Oblion/compare/v0.1.0...HEAD
+[Non publié]: https://github.com/SUPASQUID/Oblion/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/SUPASQUID/Oblion/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/SUPASQUID/Oblion/releases/tag/v0.1.0

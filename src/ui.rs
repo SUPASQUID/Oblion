@@ -96,6 +96,9 @@ pub enum Message {
     ConfirmQuit(bool),
     OpenPdf(PathBuf),
     OpenFolder(PathBuf, Option<PathBuf>),
+    /// Écran Résultat, commandes firmware bloquées : retour à la Configuration avec l'option
+    /// d'écrasement (repli) présélectionnée.
+    RetryClear(usize),
     NewErase,
     HistoryFilter(HistoryFilter),
     HistorySearch(String),
@@ -145,6 +148,8 @@ pub struct ConfigForm {
     pub customer: Customer,
     pub technician: String,
     pub tag: String,
+    /// Bandeau affiché en tête des méthodes (retour depuis l'écran Résultat).
+    pub hint: Option<String>,
 }
 
 impl ConfigForm {
@@ -369,6 +374,7 @@ impl App {
             customer: Customer::default(),
             technician: self.cfg.technician.name.clone(),
             tag: String::new(),
+            hint: None,
         });
         self.code.clear();
         self.label_checked = false;
@@ -764,6 +770,24 @@ fn update(app: &mut App, msg: Message) -> Task<Message> {
             if let Some(f) = app.form.as_mut() {
                 if i < f.options.len() {
                     f.selected = Some(i);
+                }
+            }
+            Task::none()
+        }
+        Message::RetryClear(i) => {
+            if app.job_running() {
+                return Task::none();
+            }
+            let blocked = matches!(&app.outcome, Some(Outcome::Finished(f)) if f.firmware_blocked);
+            if let Some(f) = app.form.as_mut() {
+                if state::clear_option(blocked, &f.options) == Some(i) {
+                    f.selected = Some(i);
+                    f.hint = Some(state::CLEAR_HINT.to_string());
+                    // Nouvelle confirmation par code obligatoire.
+                    app.code.clear();
+                    app.label_checked = false;
+                    app.notice = None;
+                    app.screen = Screen::Config;
                 }
             }
             Task::none()
