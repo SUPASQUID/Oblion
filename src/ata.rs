@@ -335,14 +335,323 @@ pub fn decode(out: &[u8], cmd: &AtaCmd) -> Result<AtaResult, AtaError> {
     })
 }
 
-/// Envoie la commande sur la poignée. N'EST PAS filtré : réservé à `ReadOnlyAta`
-/// (qui filtre) et à `RawDisk` (autorisation armée).
-pub(crate) fn exec_on_handle(h: &Handle, cmd: &AtaCmd) -> Result<AtaResult, AtaError> {
+// ---------- Seconde voie : SCSI ATA PASS-THROUGH (16) (traduction SAT) ----------
+//
+// Réimplémenté d'après ntddscsi.h (SCSI_PASS_THROUGH, IOCTL_SCSI_PASS_THROUGH) et la norme
+// T10 SAT (commande 85h, descripteur de sense « ATA Status Return » 09h, format fixe 00h/1Dh).
+// Certains pilotes (Intel RST, certains pilotes AHCI) refusent IOCTL_ATA_PASS_THROUGH mais
+// acceptent la commande SCSI 85h, que leur couche de traduction transmet au disque.
+
+/// CTL_CODE(IOCTL_SCSI_BASE, 0x0401, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS).
+pub const IOCTL_SCSI_PASS_THROUGH: u32 = winio::ctl_code(0x4, 0x0401, 0, 1 | 2);
+
+/// Miroir de SCSI_PASS_THROUGH (ntddscsi.h, x64).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScsiPassThrough {
+    pub length: u16,
+    pub scsi_status: u8,
+    pub path_id: u8,
+    pub target_id: u8,
+    pub lun: u8,
+    pub cdb_length: u8,
+    pub sense_info_length: u8,
+    pub data_in: u8,
+    pub data_transfer_length: u32,
+    pub time_out_value: u32,
+    pub data_buffer_offset: usize,
+    pub sense_info_offset: u32,
+    pub cdb: [u8; 16],
+}
+
+pub const SPT_SIZE: usize = size_of::<ScsiPassThrough>();
+const SENSE_LEN: usize = 32;
+const SPT_SENSE_OFFSET: usize = SPT_SIZE;
+/// Données après le sense (multiple de 8).
+pub const SPT_DATA_OFFSET: usize = SPT_SIZE + SENSE_LEN;
+const SPT_OFF_STATUS: usize = offset_of!(ScsiPassThrough, scsi_status);
+const SPT_OFF_CDBLEN: usize = offset_of!(ScsiPassThrough, cdb_length);
+const SPT_OFF_SENSELEN: usize = offset_of!(ScsiPassThrough, sense_info_length);
+const SPT_OFF_DATAIN: usize = offset_of!(ScsiPassThrough, data_in);
+const SPT_OFF_DTL: usize = offset_of!(ScsiPassThrough, data_transfer_length);
+const SPT_OFF_TIMEOUT: usize = offset_of!(ScsiPassThrough, time_out_value);
+const SPT_OFF_DBO: usize = offset_of!(ScsiPassThrough, data_buffer_offset);
+const SPT_OFF_SIO: usize = offset_of!(ScsiPassThrough, sense_info_offset);
+const SPT_OFF_CDB: usize = offset_of!(ScsiPassThrough, cdb);
+
+const SCSI_IOCTL_DATA_OUT: u8 = 0;
+const SCSI_IOCTL_DATA_IN: u8 = 1;
+const SCSI_IOCTL_DATA_UNSPECIFIED: u8 = 2;
+const SAT_ATA_PASS_THROUGH_16: u8 = 0x85;
+const SCSI_STATUS_GOOD: u8 = 0x00;
+const SCSI_STATUS_CHECK_CONDITION: u8 = 0x02;
+const SENSE_NO_SENSE: u8 = 0x0;
+const SENSE_RECOVERED_ERROR: u8 = 0x1;
+const SENSE_ILLEGAL_REQUEST: u8 = 0x5;
+
+/// Commandes dont on DOIT lire les registres de sortie (adresse max, état Sanitize, seuil
+/// SMART dépassé) : sans eux, le résultat est inexploitable.
+fn needs_registers(c: &AtaCmd) -> bool {
+    match c.command {
+        CMD_READ_NATIVE_MAX_EXT | CMD_READ_NATIVE_MAX => true,
+        CMD_SANITIZE => c.features == SAN_STATUS,
+        CMD_SMART => c.features == SMART_RETURN_STATUS,
+        _ => false,
+    }
+}
+
+/// CDB ATA PASS-THROUGH (16). Transfert PIO compté en blocs de 512 octets dans le champ
+/// COUNT (T_LENGTH = 2, BYTE_BLOCK = 1) ; CK_COND = 1 pour les commandes sans données afin
+/// d'obtenir les registres de sortie.
+pub fn sat_cdb(cmd: &AtaCmd) -> [u8; 16] {
+    let n = data_len(cmd);
+    let (protocol, byte2, count) = match &cmd.data {
+        DataDir::None => (3u8, 1u8 << 5, cmd.count),
+        DataDir::In(_) => (4, (1 << 3) | (1 << 2) | 2, sat_count(cmd, n)),
+        DataDir::Out(_) => (5, (1 << 2) | 2, sat_count(cmd, n)),
+    };
+    let l = cmd.lba.to_le_bytes();
+    let device = if cmd.ext {
+        cmd.device
+    } else {
+        cmd.device | (l[3] & 0x0F)
+    };
+    let (f, c) = (cmd.features.to_be_bytes(), count.to_be_bytes());
+    let (hi_lba_lo, hi_lba_mid, hi_lba_hi) = if cmd.ext {
+        (l[3], l[4], l[5])
+    } else {
+        (0, 0, 0)
+    };
+    [
+        SAT_ATA_PASS_THROUGH_16,
+        (protocol << 1) | cmd.ext as u8,
+        byte2,
+        if cmd.ext { f[0] } else { 0 },
+        f[1],
+        if cmd.ext { c[0] } else { 0 },
+        c[1],
+        hi_lba_lo,
+        l[0],
+        hi_lba_mid,
+        l[1],
+        hi_lba_hi,
+        l[2],
+        device,
+        cmd.command,
+        0,
+    ]
+}
+
+/// COUNT d'une commande avec données : nombre de blocs de 512 octets si la commande ne
+/// l'utilise pas elle-même (IDENTIFY, SMART READ, SECURITY…).
+fn sat_count(cmd: &AtaCmd, n: usize) -> u16 {
+    if cmd.count == 0 {
+        n.div_ceil(512) as u16
+    } else {
+        cmd.count
+    }
+}
+
+/// Tampon d'entrée : SCSI_PASS_THROUGH, zone de sense, puis les données.
+pub fn sat_encode(cmd: &AtaCmd) -> Vec<u8> {
+    let n = data_len(cmd);
+    let mut b = vec![0u8; SPT_DATA_OFFSET + n];
+    put_u16(&mut b, 0, SPT_SIZE as u16);
+    b[SPT_OFF_CDBLEN] = 16;
+    b[SPT_OFF_SENSELEN] = SENSE_LEN as u8;
+    b[SPT_OFF_DATAIN] = match &cmd.data {
+        DataDir::None => SCSI_IOCTL_DATA_UNSPECIFIED,
+        DataDir::In(_) => SCSI_IOCTL_DATA_IN,
+        DataDir::Out(v) => {
+            b[SPT_DATA_OFFSET..].copy_from_slice(v);
+            SCSI_IOCTL_DATA_OUT
+        }
+    };
+    put_u32(&mut b, SPT_OFF_DTL, n as u32);
+    put_u32(&mut b, SPT_OFF_TIMEOUT, cmd.timeout_secs.max(1));
+    put_u64(&mut b, SPT_OFF_DBO, SPT_DATA_OFFSET as u64);
+    put_u32(&mut b, SPT_OFF_SIO, SPT_SENSE_OFFSET as u32);
+    b[SPT_OFF_CDB..SPT_OFF_CDB + 16].copy_from_slice(&sat_cdb(cmd));
+    b
+}
+
+/// Registres renvoyés dans le sense : (error, status, count, lba, device, complets ?).
+/// « complets » = faux si la commande est 48 bits et que les octets hauts manquent.
+type SatRegs = (u8, u8, u16, u64, u8, bool);
+
+/// Sense : (clé, registres ATA s'ils sont présents).
+fn parse_sense(sense: &[u8], cmd: &AtaCmd) -> Option<(u8, Option<SatRegs>)> {
+    match sense.first()? & 0x7F {
+        // Format descripteur : on cherche le descripteur ATA Status Return (09h).
+        0x72 | 0x73 => {
+            let key = sense.get(1)? & 0x0F;
+            let end = (8 + *sense.get(7)? as usize).min(sense.len());
+            let mut i = 8;
+            while i + 2 <= end {
+                let (kind, len) = (sense[i], sense[i + 1] as usize);
+                if kind == 0x09 && len >= 12 && i + 14 <= sense.len() {
+                    let d = &sense[i..i + 14];
+                    let ext = d[2] & 1 != 0;
+                    let mut count = d[5] as u16;
+                    let mut lba = d[7] as u64 | (d[9] as u64) << 8 | (d[11] as u64) << 16;
+                    if ext {
+                        count |= (d[4] as u16) << 8;
+                        lba |= (d[6] as u64) << 24 | (d[8] as u64) << 32 | (d[10] as u64) << 40;
+                    } else if !cmd.ext {
+                        lba |= ((d[12] & 0x0F) as u64) << 24;
+                    }
+                    return Some((key, Some((d[3], d[13], count, lba, d[12], ext || !cmd.ext))));
+                }
+                i += 2 + len;
+            }
+            Some((key, None))
+        }
+        // Format fixe : registres présents si ASC/ASCQ = 00h/1Dh (ATA PASS THROUGH
+        // INFORMATION AVAILABLE).
+        0x70 | 0x71 => {
+            let key = sense.get(2)? & 0x0F;
+            if sense.len() < 14 || (sense[12], sense[13]) != (0x00, 0x1D) {
+                return Some((key, None));
+            }
+            let upper = sense[8] & 0x60 != 0;
+            let mut lba = sense[9] as u64 | (sense[10] as u64) << 8 | (sense[11] as u64) << 16;
+            if !cmd.ext {
+                lba |= ((sense[5] & 0x0F) as u64) << 24;
+            }
+            let complete = !cmd.ext || !upper;
+            Some((
+                key,
+                Some((sense[3], sense[4], sense[6] as u16, lba, sense[5], complete)),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Résultat de la seconde voie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SatOutcome {
+    /// La couche de traduction a traité la commande (succès ou erreur du disque).
+    Done(Result<AtaResult, AtaError>),
+    /// Refusée par le pilote ou sa couche SAT : la commande n'a pas atteint le disque.
+    Refused,
+}
+
+/// Décode le tampon de sortie de la seconde voie (pur, testable).
+pub fn sat_decode(out: &[u8], cmd: &AtaCmd) -> SatOutcome {
+    use SatOutcome::*;
+    if out.len() < SPT_DATA_OFFSET {
+        return Done(Err(AtaError::Invalid("tampon SCSI trop court".into())));
+    }
+    let n = data_len(cmd);
+    let data = || -> Result<Vec<u8>, AtaError> {
+        if !matches!(cmd.data, DataDir::In(_)) {
+            return Ok(Vec::new());
+        }
+        let got = u32::from_le_bytes(out[SPT_OFF_DTL..SPT_OFF_DTL + 4].try_into().unwrap());
+        if (got as usize) < n {
+            return Err(AtaError::Invalid(format!(
+                "données incomplètes par la voie SCSI ({got}/{n} octets)"
+            )));
+        }
+        out.get(SPT_DATA_OFFSET..SPT_DATA_OFFSET + n)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| AtaError::Invalid("données manquantes".into()))
+    };
+    let sense = &out[SPT_SENSE_OFFSET..SPT_SENSE_OFFSET + SENSE_LEN];
+    match out[SPT_OFF_STATUS] {
+        SCSI_STATUS_GOOD => {
+            if needs_registers(cmd) {
+                return Done(Err(AtaError::Invalid(
+                    "registres de sortie non renvoyés par la voie SCSI".into(),
+                )));
+            }
+            Done(data().map(|data| AtaResult {
+                status: 0x50,
+                data,
+                ..AtaResult::default()
+            }))
+        }
+        SCSI_STATUS_CHECK_CONDITION => match parse_sense(sense, cmd) {
+            // La couche SAT refuse la commande 85h ou ses champs : rien n'a atteint le disque.
+            Some((SENSE_ILLEGAL_REQUEST, None)) => Refused,
+            Some((key, Some((error, status, count, lba, device, complete)))) => {
+                let failed = status & (0x01 | 0x20) != 0
+                    || !matches!(key, SENSE_NO_SENSE | SENSE_RECOVERED_ERROR);
+                if failed {
+                    // Erreur signalée sans bit ERR : on la force (jamais de faux succès).
+                    let status = if status & 0x21 == 0 {
+                        status | 0x01
+                    } else {
+                        status
+                    };
+                    let error = if error == 0 { 0x04 } else { error };
+                    return Done(Err(AtaError::Device { status, error }));
+                }
+                if needs_registers(cmd) && !complete {
+                    return Done(Err(AtaError::Invalid(
+                        "registres 48 bits incomplets par la voie SCSI".into(),
+                    )));
+                }
+                Done(data().map(|data| AtaResult {
+                    error,
+                    status,
+                    count,
+                    lba,
+                    device,
+                    data,
+                }))
+            }
+            Some((key, None)) => Done(Err(AtaError::Invalid(format!(
+                "voie SCSI : sense {key:#04X} sans registres ATA"
+            )))),
+            None => Done(Err(AtaError::Invalid("voie SCSI : sense illisible".into()))),
+        },
+        s => Done(Err(AtaError::Invalid(format!(
+            "voie SCSI : état SCSI {s:#04X}"
+        )))),
+    }
+}
+
+fn exec_apt(h: &Handle, cmd: &AtaCmd) -> Result<AtaResult, AtaError> {
     let input = encode(cmd);
     let mut out = AlignedBuf::new(input.len());
     winio::ioctl(h, IOCTL_ATA_PASS_THROUGH, &input, out.as_mut_slice())
         .map_err(AtaError::Windows)?;
     decode(out.as_slice(), cmd)
+}
+
+fn exec_sat(h: &Handle, cmd: &AtaCmd) -> SatOutcome {
+    let input = sat_encode(cmd);
+    let mut out = AlignedBuf::new(input.len());
+    match winio::ioctl(h, IOCTL_SCSI_PASS_THROUGH, &input, out.as_mut_slice()) {
+        Ok(_) => sat_decode(out.as_slice(), cmd),
+        Err(c) if TRANSPORT_REFUSALS.contains(&c) => SatOutcome::Refused,
+        Err(c) => SatOutcome::Done(Err(AtaError::Windows(c))),
+    }
+}
+
+/// Choix entre les deux voies à partir de leurs résultats (pur, testable) : la seconde
+/// n'est tentée que si la première a été refusée avant le disque ; si elle est refusée
+/// aussi, l'erreur d'origine est conservée.
+pub fn combine(
+    first: Result<AtaResult, AtaError>,
+    second: impl FnOnce() -> SatOutcome,
+) -> Result<AtaResult, AtaError> {
+    match first {
+        Err(e) if e.transport_refusal().is_some() => match second() {
+            SatOutcome::Done(r) => r,
+            SatOutcome::Refused => Err(e),
+        },
+        r => r,
+    }
+}
+
+/// Envoie la commande sur la poignée : IOCTL_ATA_PASS_THROUGH, puis la commande SCSI 85h si
+/// le pilote a refusé la première voie. N'EST PAS filtré : réservé à `ReadOnlyAta`
+/// (qui filtre) et à `RawDisk` (autorisation armée).
+pub(crate) fn exec_on_handle(h: &Handle, cmd: &AtaCmd) -> Result<AtaResult, AtaError> {
+    combine(exec_apt(h, cmd), || exec_sat(h, cmd))
 }
 
 /// Commandes autorisées en lecture seule : IDENTIFY, SMART (lecture/état), READ NATIVE MAX,
@@ -1175,5 +1484,218 @@ pub(crate) mod tests {
         assert_eq!(b.len(), 512);
         assert_eq!(&b[0..2], &[0, 0]);
         assert_eq!(&b[2..11], b"DiskErase");
+    }
+
+    // ---------- Seconde voie SAT ----------
+
+    #[test]
+    fn spt_layout_matches_ntddscsi_x64() {
+        assert_eq!(SPT_SIZE, 56);
+        assert_eq!(SPT_OFF_DTL, 12);
+        assert_eq!(SPT_OFF_DBO, 24);
+        assert_eq!(SPT_OFF_SIO, 32);
+        assert_eq!(SPT_OFF_CDB, 36);
+        assert_eq!(SPT_DATA_OFFSET % 8, 0);
+        assert_eq!(IOCTL_SCSI_PASS_THROUGH, 0x0004_D004);
+    }
+
+    #[test]
+    fn sat_cdb_identify_pio_in_one_block() {
+        let c = sat_cdb(&identify());
+        assert_eq!(c[0], 0x85);
+        assert_eq!(c[1], 4 << 1); // PIO Data-In, 28 bits
+        assert_eq!(c[2], 0x0E); // T_DIR | BYTE_BLOCK | T_LENGTH=2, pas de CK_COND
+        assert_eq!(c[6], 1); // 1 bloc de 512
+        assert_eq!(c[14], CMD_IDENTIFY);
+    }
+
+    #[test]
+    fn sat_cdb_sanitize_block_erase_48bit() {
+        let c = sat_cdb(&sanitize_block_erase());
+        assert_eq!(c[1], (3 << 1) | 1); // non-data, EXTEND
+        assert_eq!(c[2], 0x20); // CK_COND
+        assert_eq!((c[3], c[4]), (0x00, 0x12));
+        assert_eq!((c[5], c[6]), (0x00, 0x10)); // FAILURE MODE
+                                                // Clé 0x426B4572 : LBA 47:0 = 00 00 42 6B 45 72
+        assert_eq!([c[8], c[10], c[12]], [0x72, 0x45, 0x6B]);
+        assert_eq!([c[7], c[9], c[11]], [0x42, 0x00, 0x00]);
+        assert_eq!(c[13], DEV_LBA);
+        assert_eq!(c[14], CMD_SANITIZE);
+    }
+
+    #[test]
+    fn sat_cdb_security_out_and_smart_28bit() {
+        let c = sat_cdb(&security_set_password("x"));
+        assert_eq!(c[1], 5 << 1);
+        assert_eq!(c[2], 0x06); // T_DIR = 0 (sortie)
+        assert_eq!(c[6], 1);
+        let s = sat_cdb(&smart_return_status());
+        assert_eq!(s[2], 0x20);
+        assert_eq!((s[10], s[12]), (0x4F, 0xC2));
+        assert_eq!(s[4], 0xDA);
+        let e = sat_encode(&security_set_password("x"));
+        assert_eq!(e.len(), SPT_DATA_OFFSET + 512);
+        assert_eq!(e[SPT_OFF_DATAIN], SCSI_IOCTL_DATA_OUT);
+        assert_eq!(&e[SPT_DATA_OFFSET + 2..SPT_DATA_OFFSET + 3], b"x");
+    }
+
+    fn sat_out(cmd: &AtaCmd, status: u8, sense: &[u8], dtl: u32) -> Vec<u8> {
+        let mut o = sat_encode(cmd);
+        o[SPT_OFF_STATUS] = status;
+        o[SPT_SENSE_OFFSET..SPT_SENSE_OFFSET + sense.len()].copy_from_slice(sense);
+        put_u32(&mut o, SPT_OFF_DTL, dtl);
+        o
+    }
+
+    /// Sense descripteur avec ATA Status Return.
+    fn desc_sense(key: u8, ext: bool, error: u8, status: u8, lba: u64, count: u16) -> Vec<u8> {
+        let l = lba.to_le_bytes();
+        let c = count.to_le_bytes();
+        let mut s = vec![0x72, key, 0x00, 0x1D, 0, 0, 0, 14];
+        s.extend_from_slice(&[
+            0x09, 0x0C, ext as u8, error, c[1], c[0], l[3], l[0], l[4], l[1], l[5], l[2], 0x40,
+            status,
+        ]);
+        s
+    }
+
+    #[test]
+    fn sat_identify_good_returns_data() {
+        let cmd = identify();
+        let mut o = sat_out(&cmd, 0, &[], 512);
+        o[SPT_DATA_OFFSET] = 0xAB;
+        match sat_decode(&o, &cmd) {
+            SatOutcome::Done(Ok(r)) => {
+                assert_eq!((r.status, r.data[0], r.data.len()), (0x50, 0xAB, 512))
+            }
+            x => panic!("{x:?}"),
+        }
+        let short = sat_out(&cmd, 0, &[], 0);
+        assert!(matches!(
+            sat_decode(&short, &cmd),
+            SatOutcome::Done(Err(AtaError::Invalid(_)))
+        ));
+    }
+
+    #[test]
+    fn sat_registers_from_descriptor_48bit() {
+        let cmd = read_native_max_ext();
+        let o = sat_out(
+            &cmd,
+            2,
+            &desc_sense(1, true, 0, 0x50, 0x0000_3A38_6030, 0),
+            0,
+        );
+        match sat_decode(&o, &cmd) {
+            SatOutcome::Done(Ok(r)) => assert_eq!(r.lba, 0x0000_3A38_6030),
+            x => panic!("{x:?}"),
+        }
+        // Sans EXTEND : octets hauts manquants -> inexploitable, jamais un faux résultat.
+        let o = sat_out(&cmd, 2, &desc_sense(1, false, 0, 0x50, 0x6030, 0), 0);
+        assert!(matches!(
+            sat_decode(&o, &cmd),
+            SatOutcome::Done(Err(AtaError::Invalid(_)))
+        ));
+        // GOOD sans registres pour une commande qui en a besoin -> inexploitable.
+        let o = sat_out(&cmd, 0, &[], 0);
+        assert!(matches!(
+            sat_decode(&o, &cmd),
+            SatOutcome::Done(Err(AtaError::Invalid(_)))
+        ));
+    }
+
+    #[test]
+    fn sat_abort_is_device_error_never_success() {
+        let cmd = sanitize_block_erase();
+        let o = sat_out(&cmd, 2, &desc_sense(0x0B, true, 0x04, 0x51, 0, 0), 0);
+        assert_eq!(
+            sat_decode(&o, &cmd),
+            SatOutcome::Done(Err(AtaError::Device {
+                status: 0x51,
+                error: 0x04
+            }))
+        );
+        // Clé ABORTED COMMAND avec un registre d'état « propre » : échec forcé.
+        let o = sat_out(&cmd, 2, &desc_sense(0x0B, true, 0, 0x50, 0, 0), 0);
+        assert!(matches!(
+            sat_decode(&o, &cmd),
+            SatOutcome::Done(Err(AtaError::Device { .. }))
+        ));
+        // Sense ABORTED sans registres : inexploitable (pas un refus du transport).
+        let o = sat_out(
+            &cmd,
+            2,
+            &[0x70, 0, 0x0B, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0],
+            0,
+        );
+        assert!(matches!(
+            sat_decode(&o, &cmd),
+            SatOutcome::Done(Err(AtaError::Invalid(_)))
+        ));
+    }
+
+    #[test]
+    fn sat_illegal_request_without_registers_is_refusal() {
+        let cmd = sanitize_block_erase();
+        // INVALID COMMAND OPERATION CODE, format fixe.
+        let o = sat_out(
+            &cmd,
+            2,
+            &[0x70, 0, 0x05, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x20, 0x00],
+            0,
+        );
+        assert_eq!(sat_decode(&o, &cmd), SatOutcome::Refused);
+        // INVALID FIELD IN CDB, format descripteur.
+        let o = sat_out(&cmd, 2, &[0x72, 0x05, 0x24, 0x00, 0, 0, 0, 0], 0);
+        assert_eq!(sat_decode(&o, &cmd), SatOutcome::Refused);
+    }
+
+    #[test]
+    fn sat_fixed_format_registers_28bit() {
+        let cmd = smart_return_status();
+        // error 0, status 0x50, device 0x40, count 0, LBA mid/high = 2C F4 (seuil dépassé)
+        let s = [
+            0x70, 0, 0x01, 0x00, 0x50, 0x40, 0x00, 10, 0, 0x00, 0xF4, 0x2C, 0x00, 0x1D,
+        ];
+        match sat_decode(&sat_out(&cmd, 2, &s, 0), &cmd) {
+            SatOutcome::Done(Ok(r)) => assert_eq!(r.lba & 0xFF_FF00, 0x2C_F400),
+            x => panic!("{x:?}"),
+        }
+    }
+
+    #[test]
+    fn combine_tries_second_route_only_after_transport_refusal() {
+        let ok = || {
+            SatOutcome::Done(Ok(AtaResult {
+                status: 0x50,
+                ..Default::default()
+            }))
+        };
+        let abrt = AtaError::Device {
+            status: 0x51,
+            error: 4,
+        };
+        // Première voie OK ou refus du disque : la seconde n'est jamais appelée.
+        assert!(combine(Ok(AtaResult::default()), || panic!("appel inattendu")).is_ok());
+        assert_eq!(
+            combine(Err(abrt.clone()), || panic!("appel inattendu")),
+            Err(abrt.clone())
+        );
+        assert_eq!(
+            combine(Err(AtaError::Windows(121)), || panic!("appel inattendu")),
+            Err(AtaError::Windows(121))
+        );
+        // Refus du pilote : seconde voie.
+        assert!(combine(Err(AtaError::Windows(50)), ok).is_ok());
+        assert_eq!(
+            combine(Err(AtaError::Windows(50)), || SatOutcome::Done(Err(
+                abrt.clone()
+            ))),
+            Err(abrt)
+        );
+        // Les deux refusées : erreur d'origine (toujours un refus du transport).
+        let r = combine(Err(AtaError::Windows(50)), || SatOutcome::Refused);
+        assert_eq!(r, Err(AtaError::Windows(50)));
+        assert_eq!(r.unwrap_err().transport_refusal(), Some(50));
     }
 }

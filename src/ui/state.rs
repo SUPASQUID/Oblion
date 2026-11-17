@@ -47,24 +47,27 @@ impl MethodOption {
 }
 
 /// Options réellement possibles : mêmes combinaisons que `--method` / `--allow-fallback`,
-/// sans doublon. La première est celle de `--method auto` (recommandée) ; un refus n'est
-/// jamais proposé ; un disque gelé est montré (bloquant) s'il s'agit du choix automatique.
+/// sans doublon. La première, recommandée, est `--method auto --allow-fallback` : firmware
+/// si possible, sinon (ou si la commande firmware est refusée ou échoue) effacement par
+/// écrasement Clear, annoncé comme tel. Un refus n'est jamais proposé ; un disque gelé est
+/// montré (bloquant) s'il s'agit du choix automatique.
 pub fn method_options(disk: &DiskInfo, probe: &Probe, plan: &Plan) -> Vec<MethodOption> {
     let combos = [
-        (MethodOpt::Auto, false),
         (MethodOpt::Auto, true),
+        (MethodOpt::Auto, false),
         (MethodOpt::Firmware, false),
         (MethodOpt::Firmware, true),
         (MethodOpt::Overwrite, false),
     ];
     let mut out: Vec<MethodOption> = Vec::new();
-    for (i, (m, fb)) in combos.into_iter().enumerate() {
+    for (m, fb) in combos {
         let Ok(a) = job::analyse(disk, probe, m, false, fb) else {
             continue;
         };
         let refuse = matches!(a.decision, Decision::Refuse(_));
         let frozen = matches!(a.decision, Decision::Frozen(_));
-        if refuse || (frozen && i != 0) {
+        let auto = m == MethodOpt::Auto;
+        if refuse || (frozen && !auto) {
             continue;
         }
         // Le repli n'a de sens que pour une commande firmware (sinon doublon).
@@ -90,7 +93,8 @@ pub fn method_options(disk: &DiskInfo, probe: &Probe, plan: &Plan) -> Vec<Method
             level: job::decision_level(&a.decision),
             reason: job::decision_reason(&a, probe),
             eta,
-            recommended: i == 0,
+            // Premier choix automatique retenu (avec repli s'il a un sens, sinon sans).
+            recommended: auto && out.is_empty(),
             analysis: a,
         });
     }
@@ -382,6 +386,15 @@ mod tests {
                                               // SSD : Sanitize recommandé + repli + écrasement forcé.
         let o = method_options(&disks[3], &demo_probe(&disks[3]), &plan);
         assert!(o[0].recommended);
+        // Recommandé : firmware avec repli Clear automatique ; « sans repli » proposé à part.
+        assert!(
+            o[0].analysis.allow_fallback && o[0].cli_flags() == "--method auto --allow-fallback"
+        );
+        assert!(o
+            .iter()
+            .any(|x| !x.analysis.allow_fallback
+                && matches!(x.analysis.decision, Decision::Firmware(_))));
+        assert_eq!(o.iter().filter(|x| x.recommended).count(), 1);
         assert!(o
             .iter()
             .any(|x| x.analysis.allow_fallback && x.cli_flags().contains("--allow-fallback")));

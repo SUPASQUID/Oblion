@@ -87,8 +87,11 @@ Les deux appellent exactement le même code d'effacement et les mêmes sécurit�
 ### Conseils
 
 - Branchez le disque **en direct** (SATA ou NVMe sur la carte mère) : la plupart des adaptateurs USB
-  et certains pilotes RAID / Intel RST bloquent les commandes d'effacement firmware. Tout refus est
-  indiqué sur le certificat.
+  et certains pilotes RAID / Intel RST bloquent les commandes d'effacement firmware. Si le pilote
+  refuse la voie ATA, Oblion réessaie par la commande SCSI ATA PASS-THROUGH (SAT). Tout refus est
+  indiqué sur le certificat ; dans l'interface, le choix recommandé efface alors par écrasement
+  (NIST Clear). Pour un Purge malgré un pilote bloquant : BIOS en mode AHCI, ou démarrage sur
+  WinPE / Medicat.
 - Lancez en **administrateur**.
 - L'exécutable n'est pas signé : voir [Exe non signé](#exe-non-signé).
 - Security Erase (ATA) impose un mot de passe temporaire (`DiskErase`), retiré automatiquement ;

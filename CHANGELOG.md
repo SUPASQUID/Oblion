@@ -7,6 +7,26 @@ utilise le [versionnage sémantique](https://semver.org/lang/fr/).
 
 ## [Non publié]
 
+## [0.1.2] - 2026-11-17
+
+### Ajouté
+
+- **Seconde voie pour les commandes ATA** : si Windows ou le pilote refuse
+  IOCTL_ATA_PASS_THROUGH (erreurs 1, 50, 87), Oblion renvoie la même commande par
+  IOCTL_SCSI_PASS_THROUGH avec la commande SCSI ATA PASS-THROUGH (16) (traduction SAT),
+  acceptée par certains pilotes (Intel RST, certains pilotes AHCI) qui refusent la
+  première. Valable pour la sonde (`--info`) comme pour l'effacement. Si les deux voies
+  sont refusées, rien n'a atteint le disque et le comportement de la 0.1.1 s'applique.
+  Une erreur ou une réponse incomplète de la seconde voie n'est jamais lue comme un
+  succès. Non encore testé sur matériel réel.
+
+### Modifié
+
+- Interface : le choix recommandé est désormais « automatique avec repli » : commande
+  firmware (Purge) si possible, sinon effacement par écrasement (TRIM + 1 passe vérifiée,
+  NIST Clear, statut au mieux PARTIAL), annoncé comme tel à l'écran et sur le certificat.
+  Le choix « sans repli » reste disponible. La console garde `--allow-fallback` explicite.
+
 ## [0.1.1] - 2026-11-16
 
 ### Corrigé
